@@ -34,6 +34,10 @@ class AppConfig:
         self.check_interval: int = 60
         self.last_update: str = ""
         self.scheduled_restart: str = ""  # "HH:MM" or "" to disable
+        self.steamcmd_path: str = ""
+        self.server_update_interval: int = 60
+        self.steamcmd_timeout: int = 600
+        self.last_server_update_check: str = ""
 
     def load(self):
         config = configparser.ConfigParser()
@@ -54,6 +58,16 @@ class AppConfig:
             self.check_interval = 60
         self.last_update = s.get("last_update", "")
         self.scheduled_restart = s.get("scheduled_restart", "")
+        self.steamcmd_path = s.get("steamcmd_path", "")
+        try:
+            self.server_update_interval = int(s.get("server_update_interval", "60"))
+        except ValueError:
+            self.server_update_interval = 60
+        try:
+            self.steamcmd_timeout = int(s.get("steamcmd_timeout", "600"))
+        except ValueError:
+            self.steamcmd_timeout = 600
+        self.last_server_update_check = s.get("last_server_update_check", "")
         logger.info("Configuration loaded.")
 
     def save(self):
@@ -68,6 +82,10 @@ class AppConfig:
             "check_interval": str(self.check_interval),
             "last_update": self.last_update,
             "scheduled_restart": self.scheduled_restart,
+            "steamcmd_path": self.steamcmd_path,
+            "server_update_interval": str(self.server_update_interval),
+            "steamcmd_timeout": str(self.steamcmd_timeout),
+            "last_server_update_check": self.last_server_update_check,
         }
         with open(CONFIG_FILE, "w") as f:
             config.write(f)
@@ -371,3 +389,153 @@ class LogTailer:
                     fh.close()
                 except OSError:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Server update checking via SteamCMD
+# ---------------------------------------------------------------------------
+
+class ServerUpdateChecker:
+    """
+    Detects and applies Project Zomboid dedicated server updates via SteamCMD.
+
+    Build ID comparison flow:
+      installed buildid  ←  steamapps/appmanifest_380870.acf
+      remote buildid     ←  steamcmd +app_info_print 380870
+
+    If installed != remote → update needed.
+    If either is None (parse failure) → unknown, do not auto-update.
+    """
+
+    APP_ID = "380870"  # PZ dedicated server on Steam
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self._consecutive_failures: int = 0
+        self._MAX_FAILURES: int = 5
+
+    def get_installed_buildid(self) -> Optional[str]:
+        """
+        Read buildid from <server_dir>/steamapps/appmanifest_380870.acf.
+        Returns None if the file is missing or the buildid key is absent.
+        """
+        acf_path = os.path.join(
+            self.config.server_dir,
+            "steamapps",
+            f"appmanifest_{self.APP_ID}.acf",
+        )
+        try:
+            with open(acf_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = re.search(r'"buildid"\s+"(\d+)"', line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            logger.debug("appmanifest not found at: %s", acf_path)
+        return None
+
+    def get_remote_buildid(self) -> Optional[str]:
+        """
+        Query SteamCMD for the current depot buildid.
+
+        Parses each output line with:
+            re.search(r'^\\s+"buildid"\\s+"(\\d+)"', line)
+
+        Timeout: 30s. On failure, increments _consecutive_failures.
+        After _MAX_FAILURES consecutive failures, logs a WARNING.
+        On success, resets _consecutive_failures.
+        """
+        if not self.config.steamcmd_path:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    self.config.steamcmd_path,
+                    "+login", "anonymous",
+                    "+app_info_print", self.APP_ID,
+                    "+quit",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = result.stdout + result.stderr
+            for line in output.splitlines():
+                m = re.search(r'^\s+"buildid"\s+"(\d+)"', line)
+                if m:
+                    self._consecutive_failures = 0
+                    return m.group(1)
+            logger.debug("SteamCMD output (no buildid found):\n%s", output[:2000])
+        except subprocess.TimeoutExpired:
+            logger.warning("SteamCMD app_info_print timed out after 30s.")
+        except Exception as exc:
+            logger.warning("SteamCMD get_remote_buildid failed: %s", exc)
+
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._MAX_FAILURES:
+            logger.warning(
+                "Server update checks failing (%d consecutive) — "
+                "verify SteamCMD path and network access.",
+                self._consecutive_failures,
+            )
+        return None
+
+    def update_needed(self) -> Optional[bool]:
+        """
+        Compare installed vs. remote buildid.
+
+        Returns:
+          True   — buildids differ (update available)
+          False  — buildids match (up to date)
+          None   — either buildid is None (check failed; caller must NOT auto-update)
+        """
+        installed = self.get_installed_buildid()
+        remote = self.get_remote_buildid()
+        if installed is None or remote is None:
+            return None
+        return installed != remote
+
+    def run_update(self) -> bool:
+        """
+        Run SteamCMD to update the server files in place.
+
+        Precondition: server process must already be stopped.
+
+        Uses +force_install_dir with an os.path.normpath'd path (handles
+        forward-slash input on Windows). +validate is included by default
+        to detect and repair partial downloads.
+
+        Timeout: config.steamcmd_timeout (default 600s).
+        Returns True on exit code 0, False on failure or timeout.
+        """
+        server_dir_norm = os.path.normpath(self.config.server_dir)
+        try:
+            result = subprocess.run(
+                [
+                    self.config.steamcmd_path,
+                    "+login", "anonymous",
+                    "+force_install_dir", server_dir_norm,
+                    f"+app_update {self.APP_ID} validate",
+                    "+quit",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.config.steamcmd_timeout,
+            )
+            if result.returncode == 0:
+                logger.info("SteamCMD update completed successfully.")
+                return True
+            logger.error(
+                "SteamCMD exited with code %d.\nOutput: %s",
+                result.returncode,
+                result.stdout[-2000:],
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "SteamCMD update timed out after %ds.", self.config.steamcmd_timeout
+            )
+            return False
+        except Exception as exc:
+            logger.error("SteamCMD run_update failed: %s", exc)
+            return False

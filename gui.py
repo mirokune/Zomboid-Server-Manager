@@ -15,7 +15,7 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw
 import pystray
 
-from backend import AppConfig, ServerManager, LogParser, LogTailer
+from backend import AppConfig, ServerManager, LogParser, LogTailer, ServerUpdateChecker
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,12 @@ _BROADCAST_AT: dict[int, str] = {
     300: "Server restarting in 5 minutes for mod updates.",
     120: "Server restarting in 2 minutes for mod updates.",
     60:  "Server restarting in 1 minute for mod updates. Please find a safe location.",
+}
+
+_SERVER_UPDATE_BROADCAST_AT: dict[int, str] = {
+    300: "Server restarting in 5 minutes for a game update.",
+    120: "Server restarting in 2 minutes for a game update.",
+    60:  "Server restarting in 1 minute for a game update. Please find a safe location.",
 }
 
 _STATUS_POLL_MS = 60_000   # auto-refresh server status every 60 s  (#6)
@@ -52,9 +58,14 @@ class App(ctk.CTk):
         self._sched_job: Optional[str] = None
         self._countdown_remaining: int = 0
         self._countdown_active: bool = False
+        self._countdown_broadcast_messages: dict = _BROADCAST_AT
+        self._countdown_action = None
+        self._countdown_post_fn = None
         self._log_tailer: Optional[LogTailer] = None
         self._server_log_queue: queue.Queue = queue.Queue()
         self._last_sched_restart_date: Optional[date] = None
+        self._server_update_check_job: Optional[str] = None
+        self._server_update_checker = ServerUpdateChecker(self.config)
 
         self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
 
@@ -63,11 +74,12 @@ class App(ctk.CTk):
 
         # Deferred startup tasks — let window render first
         self.after(400, self._check_server_status_threaded)
-        self.after(600, self._resume_auto_check)   # #1 & #3
-        self.after(800, self._start_log_tail)       # #5
-        self._start_status_poll()                   # #6
-        self._start_sched_poll()                    # #14
-        self._drain_log_queue()                     # #5 — kick off queue drain loop
+        self.after(600, self._resume_auto_check)          # #1 & #3
+        self.after(700, self._resume_server_update_check) # server update schedule
+        self.after(800, self._start_log_tail)             # #5
+        self._start_status_poll()                         # #6
+        self._start_sched_poll()                          # #14
+        self._drain_log_queue()                           # #5 — kick off queue drain loop
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -92,7 +104,7 @@ class App(ctk.CTk):
 
     def _build_control_tab(self, parent: ctk.CTkFrame):
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(5, weight=1)
+        parent.grid_rowconfigure(6, weight=1)
 
         # Status row
         sf = ctk.CTkFrame(parent)
@@ -176,21 +188,50 @@ class App(ctk.CTk):
         self._mod_list_frame.grid_columnconfigure(0, weight=1)
         self._mod_list_frame.grid_remove()
 
+        # Server update section
+        suf = ctk.CTkFrame(parent)
+        suf.grid(row=3, column=0, sticky="ew", padx=5, pady=3)
+        suf.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            suf, text="Server Update:", font=ctk.CTkFont(weight="bold")
+        ).grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
+
+        self.server_update_status_label = ctk.CTkLabel(
+            suf, text="Not checked", text_color="gray"
+        )
+        self.server_update_status_label.grid(
+            row=0, column=1, padx=4, pady=(10, 4), sticky="w"
+        )
+
+        ctk.CTkButton(
+            suf, text="Check Now", width=120,
+            command=self._check_server_update_threaded,
+        ).grid(row=0, column=2, padx=10, pady=(10, 4))
+
+        self.server_update_last_check_label = ctk.CTkLabel(
+            suf, text="Last checked: Never",
+            text_color="gray", font=ctk.CTkFont(size=12),
+        )
+        self.server_update_last_check_label.grid(
+            row=1, column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
+        )
+
         # Countdown
         self.countdown_label = ctk.CTkLabel(
             parent, text="",
             text_color="#ff9900",
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.countdown_label.grid(row=3, column=0, pady=4)
+        self.countdown_label.grid(row=4, column=0, pady=4)
 
         # Activity log
         ctk.CTkLabel(
             parent, text="Activity Log:", font=ctk.CTkFont(weight="bold")
-        ).grid(row=4, column=0, padx=8, pady=(4, 0), sticky="w")
+        ).grid(row=5, column=0, padx=8, pady=(4, 0), sticky="w")
 
         self.log_box = ctk.CTkTextbox(parent, wrap="word", state="disabled")
-        self.log_box.grid(row=5, column=0, sticky="nsew", padx=5, pady=(2, 8))
+        self.log_box.grid(row=6, column=0, sticky="nsew", padx=5, pady=(2, 8))
 
     # ---------- RCON Console tab (#4) ----------
 
@@ -257,13 +298,16 @@ class App(ctk.CTk):
         parent.grid_columnconfigure(1, weight=1)
 
         base_rows = [
-            ("PZ Server Folder:",      "server_dir",     "dir"),
-            ("Zomboid Log Folder:",    "zomboid_dir",    "dir"),
-            ("RCON Executable:",       "rcon_path",      "file"),
-            ("Server Name:",           "server_name",    None),
-            ("Server IP:",             "server_ip",      None),
-            ("Password:",              "password",       "password"),
-            ("Check Interval (min):", "check_interval", None),
+            ("PZ Server Folder:",            "server_dir",              "dir"),
+            ("Zomboid Log Folder:",          "zomboid_dir",             "dir"),
+            ("RCON Executable:",             "rcon_path",               "file"),
+            ("Server Name:",                 "server_name",             None),
+            ("Server IP:",                   "server_ip",               None),
+            ("Password:",                    "password",                "password"),
+            ("Check Interval (min):",        "check_interval",          None),
+            ("SteamCMD Path:",               "steamcmd_path",           "file"),
+            ("Server Update Interval (min):", "server_update_interval", None),
+            ("SteamCMD Timeout (sec):",      "steamcmd_timeout",        None),
         ]
 
         self._settings_entries: dict[str, ctk.CTkEntry] = {}
@@ -329,16 +373,24 @@ class App(ctk.CTk):
             e[key].delete(0, "end")
             e[key].insert(0, str(val))
 
-        put("server_dir",     cfg.server_dir)
-        put("zomboid_dir",    cfg.zomboid_dir)
-        put("rcon_path",      cfg.rcon_path)
-        put("server_name",    cfg.server_name)
-        put("server_ip",      cfg.server_ip)
-        put("password",       cfg.password)
-        put("check_interval", cfg.check_interval)
+        put("server_dir",              cfg.server_dir)
+        put("zomboid_dir",             cfg.zomboid_dir)
+        put("rcon_path",               cfg.rcon_path)
+        put("server_name",             cfg.server_name)
+        put("server_ip",               cfg.server_ip)
+        put("password",                cfg.password)
+        put("check_interval",          cfg.check_interval)
+        put("steamcmd_path",           cfg.steamcmd_path)
+        put("server_update_interval",  cfg.server_update_interval)
+        put("steamcmd_timeout",        cfg.steamcmd_timeout)
 
         if cfg.last_update:
             self.last_check_label.configure(text=f"Last checked: {cfg.last_update}")
+
+        if cfg.last_server_update_check:
+            self.server_update_last_check_label.configure(
+                text=f"Last checked: {cfg.last_server_update_check}"
+            )
 
         # Restore scheduled restart dropdowns
         sched = cfg.scheduled_restart.strip()
@@ -367,6 +419,15 @@ class App(ctk.CTk):
             self.config.check_interval = int(e["check_interval"].get())
         except ValueError:
             self.config.check_interval = 60
+        self.config.steamcmd_path = e["steamcmd_path"].get()
+        try:
+            self.config.server_update_interval = int(e["server_update_interval"].get())
+        except ValueError:
+            self.config.server_update_interval = 60
+        try:
+            self.config.steamcmd_timeout = int(e["steamcmd_timeout"].get())
+        except ValueError:
+            self.config.steamcmd_timeout = 600
 
         hour_val = self._sched_hour.get()
         self.config.scheduled_restart = (
@@ -499,39 +560,51 @@ class App(ctk.CTk):
         self._sched_job = self.after(_SCHED_POLL_MS, self._check_scheduled_restart)
 
     # ------------------------------------------------------------------
+    # Check cycle helpers (shared by mod + server update pipelines)
+    # ------------------------------------------------------------------
+
+    def _resume_check_cycle(
+        self, last_ts: str, interval_min: int, check_fn, label: str
+    ) -> str:
+        """
+        Schedule the first run of a periodic check cycle on startup.
+        Returns the after() job ID.
+
+          - Never run  → first check in 10 s
+          - Overdue    → check in 10 s
+          - Time remaining → schedule for the remaining portion of the interval
+        """
+        if not last_ts:
+            self._log(
+                f"No previous {label} check found — scheduling first check in 10 s."
+            )
+            return self.after(10_000, check_fn)
+        try:
+            last = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+            elapsed = (datetime.now() - last).total_seconds()
+            remaining = interval_min * 60 - elapsed
+            if remaining <= 30:
+                self._log(f"{label} check is overdue — checking in 10 s.")
+                return self.after(10_000, check_fn)
+            mins, secs = divmod(int(remaining), 60)
+            self._log(
+                f"Resuming {label} check schedule — next check in {mins}m {secs}s."
+            )
+            return self.after(int(remaining * 1000), check_fn)
+        except ValueError:
+            return self.after(10_000, check_fn)
+
+    # ------------------------------------------------------------------
     # Mod update checking (#1 & #3 — timer resumed on startup)
     # ------------------------------------------------------------------
 
     def _resume_auto_check(self):
-        """
-        Resume the mod-check schedule on startup based on last_update.
-          - Never checked  → first check in 10 s
-          - Overdue        → check in 10 s
-          - Time remaining → schedule for the remaining portion of the interval
-        """
-        if not self.config.last_update:
-            self._log("No previous mod check found — scheduling first check in 10 s.")
-            self._auto_check_job = self.after(10_000, self._check_mods_threaded)
-            return
-
-        try:
-            last = datetime.strptime(self.config.last_update, "%Y-%m-%d %H:%M:%S")
-            elapsed = (datetime.now() - last).total_seconds()
-            remaining = self.config.check_interval * 60 - elapsed
-
-            if remaining <= 30:
-                self._log("Mod check is overdue — checking in 10 s.")
-                self._auto_check_job = self.after(10_000, self._check_mods_threaded)
-            else:
-                mins, secs = divmod(int(remaining), 60)
-                self._log(
-                    f"Resuming mod check schedule — next check in {mins}m {secs}s."
-                )
-                self._auto_check_job = self.after(
-                    int(remaining * 1000), self._check_mods_threaded
-                )
-        except ValueError:
-            self._auto_check_job = self.after(10_000, self._check_mods_threaded)
+        self._auto_check_job = self._resume_check_cycle(
+            self.config.last_update,
+            self.config.check_interval,
+            self._check_mods_threaded,
+            "mod",
+        )
 
     def _check_mods_threaded(self):
         # Cancel any pending auto-check to prevent double-firing on manual trigger
@@ -639,9 +712,22 @@ class App(ctk.CTk):
     # Restart countdown with in-game broadcasts (#2)
     # ------------------------------------------------------------------
 
-    def _start_restart_countdown(self, seconds: int = 300):
+    def _start_restart_countdown(
+        self,
+        seconds: int = 300,
+        broadcast_messages: Optional[dict] = None,
+        action=None,
+        post_fn=None,
+    ):
         self._countdown_remaining = seconds
         self._countdown_active = True
+        self._countdown_broadcast_messages = (
+            broadcast_messages if broadcast_messages is not None else _BROADCAST_AT
+        )
+        self._countdown_action = action if action is not None else self._restart_server
+        self._countdown_post_fn = (
+            post_fn if post_fn is not None else self._schedule_next_check
+        )
         self._tick_countdown()
 
     def _tick_countdown(self):
@@ -652,9 +738,11 @@ class App(ctk.CTk):
         if remaining <= 0:
             self._countdown_active = False
             self.countdown_label.configure(text="")
-            self._log("Restart countdown finished — restarting server.")
-            self._restart_server()
-            self._schedule_next_check()
+            self._log("Restart countdown finished.")
+            action = self._countdown_action or self._restart_server
+            post_fn = self._countdown_post_fn or self._schedule_next_check
+            action()
+            post_fn()
             return
 
         mins, secs = divmod(remaining, 60)
@@ -663,9 +751,10 @@ class App(ctk.CTk):
             f"  — checking player count each minute"
         )
 
-        # Broadcast in-game warnings at key thresholds (#2)
-        if remaining in _BROADCAST_AT:
-            msg = _BROADCAST_AT[remaining]
+        # Broadcast in-game warnings at key thresholds
+        msgs = self._countdown_broadcast_messages or _BROADCAST_AT
+        if remaining in msgs:
+            msg = msgs[remaining]
             self._log(f"Broadcasting to players: {msg}")
             threading.Thread(
                 target=lambda m=msg: self._broadcast_safe(m), daemon=True
@@ -704,6 +793,184 @@ class App(ctk.CTk):
         self._log(
             f"Next mod check scheduled in {self.config.check_interval} minute(s)."
         )
+
+    # ------------------------------------------------------------------
+    # Server update pipeline (mirrors mod update pipeline)
+    # ------------------------------------------------------------------
+
+    def _resume_server_update_check(self):
+        self._server_update_check_job = self._resume_check_cycle(
+            self.config.last_server_update_check,
+            self.config.server_update_interval,
+            self._check_server_update_threaded,
+            "server update",
+        )
+
+    def _check_server_update_threaded(self):
+        # Validate SteamCMD path before doing anything
+        if not self.config.steamcmd_path or not os.path.isfile(self.config.steamcmd_path):
+            self._log(
+                "SteamCMD path not configured or not found — set it in Settings."
+            )
+            return
+
+        # Skip if a countdown is already running
+        if self._countdown_active:
+            self._log(
+                "Skipping server update check — restart already in progress."
+            )
+            interval_ms = self.config.server_update_interval * 60 * 1000
+            self._server_update_check_job = self.after(
+                interval_ms, self._check_server_update_threaded
+            )
+            return
+
+        # Cancel any pending scheduled check to prevent double-firing
+        if self._server_update_check_job:
+            self.after_cancel(self._server_update_check_job)
+            self._server_update_check_job = None
+
+        self.server_update_status_label.configure(
+            text="Checking…", text_color="orange"
+        )
+        self._log("Checking for server updates…")
+        threading.Thread(target=self._check_server_update_worker, daemon=True).start()
+
+    def _check_server_update_worker(self):
+        result = self._server_update_checker.update_needed()
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.config.last_server_update_check = now
+        self.config.save()
+
+        if result is True:
+            self.after(0, lambda: self._on_server_update_needed(now))
+        elif result is False:
+            self.after(0, lambda: self._on_server_up_to_date(now))
+        else:
+            # Check failed (None) — log and reschedule
+            self.after(0, lambda: self.server_update_status_label.configure(
+                text="Check failed — see log", text_color="red"
+            ))
+            self.after(0, lambda: self.server_update_last_check_label.configure(
+                text=f"Last checked: {now} (check failed)"
+            ))
+            self.after(0, lambda: self._log(
+                "Server update check failed — will retry next interval."
+            ))
+            self.after(0, self._schedule_next_server_update_check)
+
+    def _on_server_update_needed(self, timestamp: str):
+        self.server_update_status_label.configure(
+            text="Update available!", text_color="orange"
+        )
+        self.server_update_last_check_label.configure(
+            text=f"Last checked: {timestamp}"
+        )
+        self._log("Server update available — starting 5-minute restart countdown.")
+        self._start_restart_countdown(
+            broadcast_messages=_SERVER_UPDATE_BROADCAST_AT,
+            action=self._run_server_update_then_restart,
+            post_fn=self._schedule_next_server_update_check,
+        )
+
+    def _on_server_up_to_date(self, timestamp: str):
+        self.server_update_status_label.configure(
+            text="Server up to date  ✓", text_color="#22cc55"
+        )
+        self.server_update_last_check_label.configure(
+            text=f"Last checked: {timestamp}"
+        )
+        self._log("Server is up to date.")
+        self._schedule_next_server_update_check()
+
+    def _schedule_next_server_update_check(self):
+        if self._server_update_check_job:
+            self.after_cancel(self._server_update_check_job)
+        interval_ms = self.config.server_update_interval * 60 * 1000
+        self._server_update_check_job = self.after(
+            interval_ms, self._check_server_update_threaded
+        )
+        self._log(
+            f"Next server update check scheduled in "
+            f"{self.config.server_update_interval} minute(s)."
+        )
+
+    def _run_server_update_then_restart(self):
+        """
+        Stop server → wait for clean exit → run SteamCMD → restart.
+        Always restarts even if SteamCMD fails (keeps players from being locked out).
+        Called from the main thread; all blocking work done in a daemon thread.
+        """
+        self._log("Stopping server for SteamCMD update…")
+
+        def _do():
+            import time as _time
+
+            # Stop the server
+            try:
+                self.server.stop()
+                self.after(0, lambda: self._log(
+                    "Stop command sent — waiting for server to exit…"
+                ))
+            except Exception as exc:
+                self.after(0, lambda: self._log(f"Stop failed: {exc}"))
+                return
+
+            # Poll until stopped or 30s timeout (Issue 6A)
+            stopped = False
+            for _ in range(15):  # 15 × 2s = 30s
+                _time.sleep(2)
+                try:
+                    if not self.server.is_running():
+                        stopped = True
+                        break
+                except Exception:
+                    pass
+
+            if not stopped:
+                self.after(0, lambda: self._log(
+                    "Server did not stop within 30s — aborting SteamCMD update. "
+                    "Stop the server manually and try again."
+                ))
+                self.after(0, self._schedule_next_server_update_check)
+                return
+
+            self.after(0, lambda: self._log(
+                "Server stopped. Running SteamCMD update…"
+            ))
+            self.after(0, lambda: self.server_update_status_label.configure(
+                text="Updating…", text_color="orange"
+            ))
+
+            # Run SteamCMD update
+            success = self._server_update_checker.run_update()
+
+            if success:
+                self.after(0, lambda: self._log(
+                    "SteamCMD update completed. Starting server…"
+                ))
+                self.after(0, lambda: self.server_update_status_label.configure(
+                    text="Updated  ✓", text_color="#22cc55"
+                ))
+            else:
+                self.after(0, lambda: self._log(
+                    "Server update failed — restarting on current version. "
+                    "Check the activity log and SteamCMD path."
+                ))
+                self.after(0, lambda: self.server_update_status_label.configure(
+                    text="Update failed — restarted", text_color="red"
+                ))
+
+            # Always bring the server back up (Issue 2A)
+            try:
+                self.server.start()
+                self.after(0, lambda: self._log("Server start command sent."))
+                self.after(5000, self._check_server_status_threaded)
+            except Exception as exc:
+                self.after(0, lambda: self._log(f"Server start failed: {exc}"))
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ------------------------------------------------------------------
     # RCON Console (#4)
