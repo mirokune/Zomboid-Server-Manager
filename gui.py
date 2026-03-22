@@ -1036,8 +1036,14 @@ class App(QMainWindow):
         threading.Thread(target=self._check_server_status, daemon=True).start()
 
     def _check_server_status(self) -> bool:
+        import subprocess as _sp
         try:
             running = self.server.is_running()
+        except _sp.TimeoutExpired:
+            self._invoke(lambda: self._set_status_error(
+                "PowerShell timed out — WMI may be busy. Retrying next poll."
+            ))
+            return False
         except Exception as exc:
             self._invoke(lambda e=exc: self._set_status_error(str(e)))
             return False

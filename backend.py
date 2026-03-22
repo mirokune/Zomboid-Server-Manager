@@ -187,7 +187,11 @@ class ServerManager:
         self.config = config
 
     def is_running(self) -> bool:
-        """Return True if a matching java.exe server process is running."""
+        """Return True if a matching java.exe server process is running.
+
+        Raises subprocess.TimeoutExpired if PowerShell does not respond within
+        10 seconds, so callers are never blocked indefinitely.
+        """
         name = self.config.server_name
         if name:
             # Escape single-quotes for PowerShell -like patterns ('' = literal ')
@@ -205,7 +209,9 @@ class ServerManager:
             f"Where-Object {{ $_.Name -eq 'java.exe' -and {filter_clause} }} | "
             f"Select-Object -First 1\""
         )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=10
+        )
         return bool(result.stdout.strip())
 
     def start(self):
