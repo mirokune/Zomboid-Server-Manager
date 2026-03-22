@@ -57,6 +57,7 @@ class AppConfig:
         self.server_update_interval: int = 60
         self.steamcmd_timeout: int = 600
         self.last_server_update_check: str = ""
+        self._save_lock = threading.Lock()
 
     def load(self):
         # Migrate legacy config (next to EXE) to %APPDATA% on first run.
@@ -127,6 +128,10 @@ class AppConfig:
         logger.info("Configuration loaded from %s", dest)
 
     def save(self):
+        with self._save_lock:
+            self._save_locked()
+
+    def _save_locked(self):
         # Persist the password to Windows Credential Manager first.
         try:
             if self.password:
@@ -177,8 +182,10 @@ class ServerManager:
         """Return True if a matching java.exe server process is running."""
         name = self.config.server_name
         if name:
+            # Escape single-quotes for PowerShell -like patterns ('' = literal ')
+            safe_name = name.replace("'", "''")
             filter_clause = (
-                f"$_.CommandLine -like '*-servername {name}*' -and "
+                f"$_.CommandLine -like '*-servername {safe_name}*' -and "
                 f"$_.CommandLine -like '*-Djava.awt.headless=true*'"
             )
         else:
@@ -248,8 +255,15 @@ class ServerManager:
         if not cfg.password:
             raise ValueError("RCON password not configured.")
 
-        args = [cfg.rcon_path, "-a", cfg.server_ip, "-p", cfg.password, command]
+        # Write password to a temp YAML config so it never appears in the process list.
+        tmp = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", delete=False
+            ) as f:
+                tmp = f.name
+                f.write(f"address: {cfg.server_ip}\npassword: {cfg.password}\n")
+            args = [cfg.rcon_path, "--config", tmp, command]
             result = subprocess.run(
                 args, capture_output=True, text=True, timeout=15
             )
@@ -257,6 +271,12 @@ class ServerManager:
         except subprocess.TimeoutExpired:
             logger.warning("RCON command '%s' timed out.", command)
             return None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -535,11 +555,17 @@ class ServerUpdateChecker:
                 timeout=30,
             )
             output = result.stdout + result.stderr
+            # Only match buildid lines that appear after the app ID header in the
+            # output, so we never pick up a stray match from SteamCMD preamble text.
+            in_app_section = False
             for line in output.splitlines():
-                m = re.search(r'^\s+"buildid"\s+"(\d+)"', line)
-                if m:
-                    self._consecutive_failures = 0
-                    return m.group(1)
+                if f'"{self.APP_ID}"' in line:
+                    in_app_section = True
+                if in_app_section:
+                    m = re.search(r'^\s+"buildid"\s+"(\d+)"', line)
+                    if m:
+                        self._consecutive_failures = 0
+                        return m.group(1)
             logger.debug("SteamCMD output (no buildid found):\n%s", output[:2000])
         except subprocess.TimeoutExpired:
             logger.warning("SteamCMD app_info_print timed out after 30s.")
