@@ -1,0 +1,26 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where this would help. "I'm always frustrated when..."
+      placeholder: I have to manually restart the server every day at the same time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      placeholder: A scheduled daily restart setting with configurable time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered (optional)
+      placeholder: I tried using a Windows Task Scheduler job but it doesn't know about player counts.

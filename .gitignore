@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# PyInstaller build output
+dist/
+build/
+*.spec.bak
+Output/
+
+# Project-specific (contains passwords — NEVER commit this)
+pz_server_config.ini
+
+# Runtime log
+pz_manager.log
+
+# gstack local reports
+.gstack/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

@@ -12,11 +12,29 @@ import logging
 import configparser
 from datetime import datetime
 from glob import glob
+from pathlib import Path
 from typing import Callable, Optional
+
+import keyring
 
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = "pz_server_config.ini"
+_KEYRING_SERVICE = "PZServerManager"
+_KEYRING_USERNAME = "rcon_password"
+
+def _config_dir() -> Path:
+    """Return %APPDATA%\\PZServerManager\\ — always writable, no admin needed."""
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    d = Path(appdata) / "PZServerManager"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _config_path() -> Path:
+    return _config_dir() / "pz_server_config.ini"
+
+def _legacy_config_path() -> Path:
+    """Path to the old config next to the EXE (pre-v0.2 location)."""
+    return Path("pz_server_config.ini")
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +48,7 @@ class AppConfig:
         self.rcon_path: str = ""
         self.server_ip: str = ""
         self.server_name: str = ""
-        self.password: str = ""
+        self.password: str = ""        # in-memory only; persisted to Credential Manager
         self.check_interval: int = 60
         self.last_update: str = ""
         self.scheduled_restart: str = ""  # "HH:MM" or "" to disable
@@ -40,18 +58,32 @@ class AppConfig:
         self.last_server_update_check: str = ""
 
     def load(self):
+        # Migrate legacy config (next to EXE) to %APPDATA% on first run.
+        legacy = _legacy_config_path()
+        dest = _config_path()
+        if legacy.exists() and not dest.exists():
+            try:
+                legacy.rename(dest)
+                logger.info("Migrated config from %s to %s", legacy, dest)
+            except OSError as exc:
+                logger.warning("Config migration failed: %s — reading legacy path.", exc)
+                dest = legacy
+
         config = configparser.ConfigParser()
-        if not os.path.exists(CONFIG_FILE):
+        if not dest.exists():
             logger.info("No config file found — using defaults.")
+            # Still try to load the password from Credential Manager in case
+            # the INI was deleted but the credential was not.
+            self.password = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME) or ""
             return
-        config.read(CONFIG_FILE)
+
+        config.read(dest)
         s = config["SETTINGS"] if "SETTINGS" in config else {}
         self.server_dir = s.get("server_dir", "")
         self.zomboid_dir = s.get("zomboid_dir", "")
         self.rcon_path = s.get("rcon_path", "")
         self.server_ip = s.get("server_ip", "")
         self.server_name = s.get("server_name", "")
-        self.password = s.get("password", "")
         try:
             self.check_interval = int(s.get("check_interval", "60"))
         except ValueError:
@@ -68,9 +100,42 @@ class AppConfig:
         except ValueError:
             self.steamcmd_timeout = 600
         self.last_server_update_check = s.get("last_server_update_check", "")
-        logger.info("Configuration loaded.")
+
+        # If old config had a plaintext password, migrate it to Credential Manager
+        # and remove it from the INI.
+        legacy_pw = s.get("password", "")
+        if legacy_pw:
+            try:
+                keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, legacy_pw)
+                logger.info("Migrated plaintext password to Windows Credential Manager.")
+            except Exception as exc:
+                logger.warning("Could not migrate password to Credential Manager: %s", exc)
+            # Rewrite the INI without the password field.
+            self.save()
+
+        # Load the password from Credential Manager (never from the INI file).
+        try:
+            self.password = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME) or ""
+        except Exception as exc:
+            logger.warning("Could not read password from Credential Manager: %s", exc)
+            self.password = ""
+
+        logger.info("Configuration loaded from %s", dest)
 
     def save(self):
+        # Persist the password to Windows Credential Manager first.
+        try:
+            if self.password:
+                keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, self.password)
+            else:
+                # Delete the stored credential if the password was cleared.
+                try:
+                    keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+                except keyring.errors.PasswordDeleteError:
+                    pass  # Credential didn't exist — nothing to delete.
+        except Exception as exc:
+            logger.warning("Could not save password to Credential Manager: %s", exc)
+
         config = configparser.ConfigParser()
         config["SETTINGS"] = {
             "server_dir": self.server_dir,
@@ -78,7 +143,7 @@ class AppConfig:
             "rcon_path": self.rcon_path,
             "server_ip": self.server_ip,
             "server_name": self.server_name,
-            "password": self.password,
+            # password intentionally omitted — stored in Windows Credential Manager
             "check_interval": str(self.check_interval),
             "last_update": self.last_update,
             "scheduled_restart": self.scheduled_restart,
@@ -87,9 +152,10 @@ class AppConfig:
             "steamcmd_timeout": str(self.steamcmd_timeout),
             "last_server_update_check": self.last_server_update_check,
         }
-        with open(CONFIG_FILE, "w") as f:
+        dest = _config_path()
+        with open(dest, "w") as f:
             config.write(f)
-        logger.info("Configuration saved.")
+        logger.info("Configuration saved to %s", dest)
 
 
 # ---------------------------------------------------------------------------

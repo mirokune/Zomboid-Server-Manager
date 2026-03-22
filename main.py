@@ -1,7 +1,7 @@
 """
 main.py — Project Zomboid Server Manager
 Entry point. Prevents duplicate instances via a local socket lock,
-then launches the CustomTkinter UI.
+then launches the PyQt6 UI.
 """
 
 import socket
@@ -40,27 +40,51 @@ def main():
     lock = _acquire_lock()
     if lock is None:
         # Another instance is already running — alert and exit.
+        # Try Qt message box first (QApplication may not exist yet, so fall back).
         try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "PZ Server Manager is already running.\n\n"
-                "Check your system tray.",
+            from PyQt6.QtWidgets import QApplication, QMessageBox
+            _qa = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.information(
+                None,
                 "Already Running",
-                0x40 | 0x1000,  # MB_ICONINFORMATION | MB_SETFOREGROUND
+                "PZ Server Manager is already running.\n\nCheck your system tray.",
             )
         except Exception:
-            print("PZ Server Manager is already running.")
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "PZ Server Manager is already running.\n\n"
+                    "Check your system tray.",
+                    "Already Running",
+                    0x40 | 0x1000,  # MB_ICONINFORMATION | MB_SETFOREGROUND
+                )
+            except Exception:
+                print("PZ Server Manager is already running.")
         sys.exit(0)
 
-    # Import here so we only pay the cost if we're the first instance
+    # DPI scaling — must be set before QApplication is created.
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import Qt
+
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+    # Import here so we only pay the cost if we're the first instance.
+    # QApplication must be created before App (which builds the window).
+    qa = QApplication(sys.argv)
+
     from gui import App
 
     app = App()
+    app.show()
     try:
-        app.mainloop()
+        exit_code = qa.exec()
     finally:
         lock.close()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

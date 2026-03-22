@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest test_backend.py -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  build:
+    needs: test           # release only publishes if tests pass
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build portable EXE (PyInstaller)
+        run: pyinstaller PZServerManager.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes
+        shell: pwsh
+
+      - name: Build installer (Inno Setup)
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          iscc /DMyAppVersion=$version build.iss
+        shell: pwsh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/PZServerManager.exe
+            Output/PZServerManager-Setup.exe
+          body: |
+            ## PZ Server Manager ${{ github.ref_name }}
+
+            ### Download
+            | File | Description |
+            |------|-------------|
+            | **PZServerManager-Setup.exe** | Installer (recommended) — creates Start Menu shortcut |
+            | **PZServerManager.exe** | Portable — no installation needed, just run it |
+
+            ### Requirements
+            - Windows 10/11
+            - [RCON CLI](https://github.com/gorcon/rcon-cli) (`rcon.exe`) — required for server communication
+            - [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD) — optional, only needed for the server update pipeline
+
+            ### First-time setup
+            1. Download and run the installer (or the portable EXE)
+            2. Open the **Settings** tab and fill in your server paths and RCON credentials
+            3. Click **Save Configuration**
+
+            ### Notes
+            - Config is saved next to the EXE. The installer defaults to your user folder (no admin needed).
+              If you chose a system-wide install path and config won't save, use the portable EXE instead.

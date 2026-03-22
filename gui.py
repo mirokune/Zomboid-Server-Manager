@@ -1,28 +1,85 @@
 """
 gui.py — Project Zomboid Server Manager
-CustomTkinter-based UI.
+PyQt6-based UI.  backend.py is intentionally untouched.
+
+Architecture overview:
+┌─ QMainWindow ──────────────────────────────────────────────────────┐
+│  QTabWidget (styled via QSS to look like a toolbar tab bar)        │
+│  ┌─ Server Control ──────────────────────────────────────────────┐ │
+│  │  QSplitter (left 260 px fixed │ right flex)                   │ │
+│  │  Left:  Status card / Countdown banner / Mod card / Game card │ │
+│  │  Right: LogViewer (activity log, dominant)                    │ │
+│  ├─ RCON Console ─────────────────────────────────────────────── │ │
+│  ├─ Server Log ──────────────────────────────────────────────────│ │
+│  └─ Settings ───────────────────────────────────────────────────  │ │
+│  QStatusBar                                                        │ │
+└────────────────────────────────────────────────────────────────────┘
+
+Threading model:
+  All backend calls run in daemon threads (QThreadPool / raw threading.Thread).
+  UI updates cross the thread boundary via pyqtSignal (queued connection,
+  automatic because emitter and receiver live in different Qt threads).
+  LogTailer (backend, unchanged) is bridged via LogBridge(QObject).
 """
 
-import os
-import queue
-import threading
+from __future__ import annotations
+
 import logging
-from datetime import datetime, date
-from tkinter import filedialog
+import os
+import re
+import threading
+from collections import deque
+from datetime import date, datetime
 from typing import Optional
 
-import customtkinter as ctk
-from PIL import Image, ImageDraw
-import pystray
+from PyQt6.QtCore import (
+    QObject,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QColor,
+    QIcon,
+    QPainter,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStackedWidget,
+    QStatusBar,
+    QSystemTrayIcon,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-from backend import AppConfig, ServerManager, LogParser, LogTailer, ServerUpdateChecker
+from backend import AppConfig, LogParser, LogTailer, ServerManager, ServerUpdateChecker
 
 logger = logging.getLogger(__name__)
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+# ---------------------------------------------------------------------------
+# Broadcast thresholds (seconds remaining → in-game message)
+# ---------------------------------------------------------------------------
 
-# Seconds remaining at which to broadcast an in-game warning to players (#2)
 _BROADCAST_AT: dict[int, str] = {
     300: "Server restarting in 5 minutes for mod updates.",
     120: "Server restarting in 2 minutes for mod updates.",
@@ -35,16 +92,290 @@ _SERVER_UPDATE_BROADCAST_AT: dict[int, str] = {
     60:  "Server restarting in 1 minute for a game update. Please find a safe location.",
 }
 
-_STATUS_POLL_MS = 60_000   # auto-refresh server status every 60 s  (#6)
-_SCHED_POLL_MS  = 60_000   # check scheduled restart time every 60 s (#14)
+_STATUS_POLL_MS = 60_000   # auto-refresh server status every 60 s
+_SCHED_POLL_MS  = 60_000   # check scheduled restart every 60 s
+
+# ---------------------------------------------------------------------------
+# Log coloring: compiled once, applied per line in LogViewer.append_line()
+# ---------------------------------------------------------------------------
+
+_LOG_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"error|failed|exception", re.I), "error"),
+    (re.compile(r"broadcast|warning|countdown",  re.I), "warn"),
+    (re.compile(r"checking|resuming|scheduling", re.I), "info"),
+    (re.compile(r"up to date|all mods|restarted|completed|saved", re.I), "success"),
+]
 
 
-class App(ctk.CTk):
-    def __init__(self):
+def _classify_line(msg: str) -> str:
+    for pattern, level in _LOG_PATTERNS:
+        if pattern.search(msg):
+            return level
+    return "default"
+
+
+# ---------------------------------------------------------------------------
+# QSS stylesheet — one place to update the entire look
+# ---------------------------------------------------------------------------
+
+APP_STYLESHEET = """
+/* ── Base ────────────────────────────────────────────────────────────── */
+QMainWindow, QWidget {
+    background: #1a1a1a;
+    color: #d0d0d0;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+}
+
+/* ── Tab bar (Portainer-style underline tabs) ─────────────────────────── */
+QTabWidget::pane {
+    border: none;
+    background: #1a1a1a;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #666;
+    padding: 8px 18px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    color: #e0e0e0;
+    border-bottom: 2px solid #4d9de0;
+}
+QTabBar::tab:hover:!selected {
+    color: #aaa;
+    background: #222;
+}
+
+/* ── GroupBox cards ──────────────────────────────────────────────────── */
+QGroupBox {
+    border: 1px solid #2e2e2e;
+    border-radius: 6px;
+    background: #1e1e1e;
+    margin-top: 8px;
+    padding-top: 8px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 6px;
+    color: #666;
+    font-size: 11px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    left: 10px;
+    top: -1px;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+QPushButton {
+    background: #2a2a2a;
+    border: 1px solid #3a3a3a;
+    border-radius: 5px;
+    color: #ccc;
+    padding: 6px 14px;
+}
+QPushButton:hover   { background: #333; border-color: #4a4a4a; }
+QPushButton:pressed { background: #222; }
+QPushButton:disabled { opacity: 0.4; }
+
+QPushButton[variant="start"] { background: #1e4620; border-color: #2d6b32; color: #7ecf7e; }
+QPushButton[variant="start"]:hover { background: #235225; }
+QPushButton[variant="stop"]  { background: #3d1818; border-color: #6b2d2d; color: #cf7e7e; }
+QPushButton[variant="stop"]:hover  { background: #4a1e1e; }
+QPushButton[variant="warn"]  { background: #3d2d10; border-color: #6b4d20; color: #cfb07e; }
+QPushButton[variant="warn"]:hover  { background: #4a3515; }
+
+/* ── Inputs ───────────────────────────────────────────────────────────── */
+QLineEdit, QComboBox {
+    background: #252525;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    color: #d0d0d0;
+    padding: 5px 8px;
+    selection-background-color: #4d9de0;
+}
+QLineEdit:focus, QComboBox:focus { border-color: #4d9de0; }
+QComboBox::drop-down { border: none; }
+QComboBox QAbstractItemView { background: #252525; border: 1px solid #3a3a3a; }
+
+/* ── Scrollbars ───────────────────────────────────────────────────────── */
+QScrollBar:vertical {
+    background: #1a1a1a; width: 8px; margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #3a3a3a; border-radius: 4px; min-height: 20px;
+}
+QScrollBar::handle:vertical:hover { background: #4a4a4a; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+/* ── Log / text boxes ─────────────────────────────────────────────────── */
+QTextEdit {
+    background: #161616;
+    border: 1px solid #272727;
+    border-radius: 5px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 12px;
+    selection-background-color: #4d9de0;
+}
+
+/* ── Countdown banner ─────────────────────────────────────────────────── */
+QFrame#countdown {
+    background: #2d2010;
+    border: 1px solid #6b4a10;
+    border-radius: 5px;
+}
+
+/* ── Status bar ───────────────────────────────────────────────────────── */
+QStatusBar {
+    background: #111;
+    border-top: 1px solid #2a2a2a;
+    color: #555;
+    font-size: 11px;
+}
+QStatusBar::item { border: none; }
+
+/* ── Splitter handle ──────────────────────────────────────────────────── */
+QSplitter::handle { background: #2e2e2e; width: 1px; }
+
+/* ── Checkbox ─────────────────────────────────────────────────────────── */
+QCheckBox { color: #ccc; spacing: 6px; }
+QCheckBox::indicator {
+    width: 14px; height: 14px;
+    border: 1px solid #3a3a3a; border-radius: 3px;
+    background: #252525;
+}
+QCheckBox::indicator:checked { background: #4d9de0; border-color: #4d9de0; }
+"""
+
+
+# ---------------------------------------------------------------------------
+# LogBridge — routes LogTailer callbacks (raw thread) into Qt signals
+# ---------------------------------------------------------------------------
+
+class LogBridge(QObject):
+    """
+    Thin QObject adapter so LogTailer (which runs in a raw threading.Thread
+    and calls line_callback from that thread) can safely deliver log lines
+    to the main-thread UI.
+
+    Qt automatically uses a QueuedConnection when emit() is called from a
+    thread different from the receiver's thread — no explicit connection type
+    needed.
+    """
+    line_received = pyqtSignal(str)
+
+
+# ---------------------------------------------------------------------------
+# LogViewer — shared log display widget used by both activity log + server log
+# ---------------------------------------------------------------------------
+
+class LogViewer(QTextEdit):
+    """
+    Read-only QTextEdit with:
+      - Per-line timestamp prefix [HH:MM:SS]
+      - Color coding via QTextCharFormat (O(1) per line, no HTML parsing)
+      - Auto-scroll (only when already at bottom — respects manual scroll)
+      - 5000-line cap via setMaximumBlockCount
+    """
+
+    COLORS: dict[str, str] = {
+        "error":   "#e05252",
+        "warn":    "#f0a030",
+        "info":    "#4d9de0",
+        "success": "#3ddc84",
+        "default": "#b0b0b0",
+    }
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.document().setMaximumBlockCount(5000)
+
+    def append_line(self, msg: str, level: str = "default") -> None:
+        """Append a timestamped, color-coded line. Safe to call from main thread only."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        color = self.COLORS.get(level, self.COLORS["default"])
+
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+
+        # Timestamp in muted grey
+        ts_fmt = QTextCharFormat()
+        ts_fmt.setForeground(QColor("#444"))
+
+        sb = self.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(f"[{ts}] ", ts_fmt)
+        cursor.insertText(f"{msg}\n", fmt)
+
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def clear_log(self) -> None:
+        self.clear()
+
+
+# ---------------------------------------------------------------------------
+# RconLineEdit — QLineEdit with Up/Down command history
+# ---------------------------------------------------------------------------
+
+class RconLineEdit(QLineEdit):
+    """
+    QLineEdit subclass that adds terminal-style Up/Down command history.
+    History is session-only (not persisted to disk).
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._history: deque[str] = deque(maxlen=50)
+        self._history_pos: int = -1  # -1 = at current input
+
+    def push_history(self, command: str) -> None:
+        if command and (not self._history or self._history[0] != command):
+            self._history.appendleft(command)
+        self._history_pos = -1
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Up:
+            if self._history and self._history_pos < len(self._history) - 1:
+                self._history_pos += 1
+                self.setText(self._history[self._history_pos])
+                self.end(False)
+        elif event.key() == Qt.Key.Key_Down:
+            if self._history_pos > 0:
+                self._history_pos -= 1
+                self.setText(self._history[self._history_pos])
+                self.end(False)
+            elif self._history_pos == 0:
+                self._history_pos = -1
+                self.clear()
+        else:
+            super().keyPressEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
+
+class App(QMainWindow):
+    """
+    PyQt6 main window. QApplication is created in main.py before this is
+    instantiated (idiomatic Qt — QApplication must exist before any QWidget).
+    """
+
+    def __init__(self) -> None:
         super().__init__()
-        self.title("Project Zomboid Server Manager")
-        self.geometry("800x740")
-        self.minsize(660, 580)
+        self.setWindowTitle("Project Zomboid Server Manager")
+        self.resize(900, 720)
+        self.setMinimumSize(660, 540)
+        self.setWindowIcon(_make_icon())
 
         # Backend
         self.config = AppConfig()
@@ -52,553 +383,818 @@ class App(ctk.CTk):
         self.server = ServerManager(self.config)
 
         # State
-        self._tray_icon: Optional[pystray.Icon] = None
-        self._auto_check_job: Optional[str] = None
-        self._poll_status_job: Optional[str] = None
-        self._sched_job: Optional[str] = None
+        self._log_tailer: Optional[LogTailer] = None
+        self._log_bridge = LogBridge()
+        self._log_bridge.line_received.connect(self._on_server_log_line)
+
         self._countdown_remaining: int = 0
         self._countdown_active: bool = False
         self._countdown_broadcast_messages: dict = _BROADCAST_AT
         self._countdown_action = None
         self._countdown_post_fn = None
-        self._log_tailer: Optional[LogTailer] = None
-        self._server_log_queue: queue.Queue = queue.Queue()
+
         self._last_sched_restart_date: Optional[date] = None
-        self._server_update_check_job: Optional[str] = None
+        self._server_running: Optional[bool] = None  # None = not yet known
+        self._auto_check_job: Optional[QTimer] = None
+        self._server_update_check_job: Optional[QTimer] = None
+        self._poll_status_job: Optional[QTimer] = None
+        self._sched_job: Optional[QTimer] = None
+        self._countdown_timer: Optional[QTimer] = None
+
         self._server_update_checker = ServerUpdateChecker(self.config)
 
-        self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+        self._settings_dirty = False
 
+        self.setStyleSheet(APP_STYLESHEET)
         self._build_ui()
         self._load_config_into_ui()
+        self._setup_tray()
 
-        # Deferred startup tasks — let window render first
-        self.after(400, self._check_server_status_threaded)
-        self.after(600, self._resume_auto_check)          # #1 & #3
-        self.after(700, self._resume_server_update_check) # server update schedule
-        self.after(800, self._start_log_tail)             # #5
-        self._start_status_poll()                         # #6
-        self._start_sched_poll()                          # #14
-        self._drain_log_queue()                           # #5 — kick off queue drain loop
+        # Deferred startup — let window render first
+        QTimer.singleShot(400, self._check_server_status_threaded)
+        QTimer.singleShot(600, self._resume_auto_check)
+        QTimer.singleShot(700, self._resume_server_update_check)
+        QTimer.singleShot(800, self._start_log_tail)
+        self._start_status_poll()
+        self._start_sched_poll()
 
     # ------------------------------------------------------------------
     # UI Construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        self.tabs = ctk.CTkTabview(self)
-        self.tabs.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)  # removes box around tab bar
+        main_layout.addWidget(self.tabs)
 
-        for name in ("Server Control", "RCON Console", "Server Log", "Settings"):
-            self.tabs.add(name)
+        self._build_control_tab()
+        self._build_rcon_tab()
+        self._build_log_tab()
+        self._build_settings_tab()
 
-        self._build_control_tab(self.tabs.tab("Server Control"))
-        self._build_rcon_tab(self.tabs.tab("RCON Console"))
-        self._build_log_tab(self.tabs.tab("Server Log"))
-        self._build_settings_tab(self.tabs.tab("Settings"))
+        # Status bar
+        self._statusbar = QStatusBar()
+        self.setStatusBar(self._statusbar)
+        self._sb_server = QLabel("● Server Unknown")
+        self._sb_server.setStyleSheet("color: #555; margin-right: 16px;")
+        self._sb_info = QLabel("")
+        self._sb_info.setStyleSheet("color: #444;")
+        self._sb_next_check = QLabel("")
+        self._sb_next_check.setStyleSheet("color: #444; margin-left: 16px;")
+        self._statusbar.addPermanentWidget(self._sb_server)
+        self._statusbar.addPermanentWidget(self._sb_info)
+        self._statusbar.addPermanentWidget(self._sb_next_check)
 
-    # ---------- Server Control tab ----------
+    # ── Server Control tab ────────────────────────────────────────────
 
-    def _build_control_tab(self, parent: ctk.CTkFrame):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(6, weight=1)
+    def _build_control_tab(self) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
 
-        # Status row
-        sf = ctk.CTkFrame(parent)
-        sf.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 3))
-        sf.grid_columnconfigure(1, weight=1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(1)
 
-        ctk.CTkLabel(
-            sf, text="Server Status:", font=ctk.CTkFont(weight="bold")
-        ).grid(row=0, column=0, padx=(12, 6), pady=10)
+        # ── Left panel ──────────────────────────────────────────────
+        left = QWidget()
+        left.setFixedWidth(264)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 8, 0)
+        left_layout.setSpacing(8)
 
-        self.status_label = ctk.CTkLabel(sf, text="Checking…", text_color="orange")
-        self.status_label.grid(row=0, column=1, padx=4, pady=10, sticky="w")
+        # Server status card
+        status_box = QGroupBox("Server Status")
+        status_inner = QVBoxLayout(status_box)
+        status_inner.setContentsMargins(12, 16, 12, 12)
+        status_inner.setSpacing(8)
 
-        ctk.CTkButton(
-            sf, text="Refresh", width=90,
-            command=self._check_server_status_threaded,
-        ).grid(row=0, column=2, padx=10, pady=10)
+        status_row = QHBoxLayout()
+        self._status_dot = QLabel("●")
+        self._status_dot.setStyleSheet("color: #666; font-size: 18px;")
+        self._status_text = QLabel("Checking…")
+        self._status_text.setStyleSheet("color: #aaa; font-size: 14px; font-weight: bold;")
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setFixedWidth(72)
+        self._refresh_btn.clicked.connect(self._check_server_status_threaded)
+        status_row.addWidget(self._status_dot)
+        status_row.addWidget(self._status_text)
+        status_row.addStretch()
+        status_row.addWidget(self._refresh_btn)
+        status_inner.addLayout(status_row)
 
-        # Control buttons
-        bf = ctk.CTkFrame(parent)
-        bf.grid(row=1, column=0, sticky="ew", padx=5, pady=3)
-        bf.grid_columnconfigure((0, 1, 2), weight=1)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self._start_btn = QPushButton("Start")
+        self._start_btn.setProperty("variant", "start")
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setProperty("variant", "stop")
+        self._restart_btn = QPushButton("Restart")
+        self._restart_btn.setProperty("variant", "warn")
+        for btn in (self._start_btn, self._stop_btn, self._restart_btn):
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn_row.addWidget(btn)
+        self._start_btn.clicked.connect(self._start_server)
+        self._stop_btn.clicked.connect(self._stop_server)
+        self._restart_btn.clicked.connect(self._restart_server)
+        status_inner.addLayout(btn_row)
+        left_layout.addWidget(status_box)
 
-        ctk.CTkButton(
-            bf, text="Start Server",
-            fg_color="#1a7f3c", hover_color="#145e2c",
-            command=self._start_server,
-        ).grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        # Countdown banner + spacer (swap to avoid reflow)
+        self._countdown_spacer = QFrame()
+        self._countdown_spacer.setFixedHeight(64)
+        self._countdown_spacer.setVisible(True)
+        left_layout.addWidget(self._countdown_spacer)
 
-        ctk.CTkButton(
-            bf, text="Stop Server",
-            fg_color="#a62020", hover_color="#7a1818",
-            command=self._stop_server,
-        ).grid(row=0, column=1, padx=10, pady=10, sticky="ew")
-
-        ctk.CTkButton(
-            bf, text="Restart Server",
-            fg_color="#7a5200", hover_color="#5a3c00",
-            command=self._restart_server,
-        ).grid(row=0, column=2, padx=10, pady=10, sticky="ew")
-
-        # Mod update section
-        mf = ctk.CTkFrame(parent)
-        mf.grid(row=2, column=0, sticky="ew", padx=5, pady=3)
-        mf.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            mf, text="Mod Updates:", font=ctk.CTkFont(weight="bold")
-        ).grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
-
-        self.mod_status_label = ctk.CTkLabel(mf, text="Not checked", text_color="gray")
-        self.mod_status_label.grid(row=0, column=1, padx=4, pady=(10, 4), sticky="w")
-
-        ctk.CTkButton(
-            mf, text="Check for Updates", width=165,
-            command=self._check_mods_threaded,
-        ).grid(row=0, column=2, padx=10, pady=(10, 4))
-
-        self.last_check_label = ctk.CTkLabel(
-            mf, text="Last checked: Never",
-            text_color="gray", font=ctk.CTkFont(size=12),
+        self._countdown_frame = QFrame()
+        self._countdown_frame.setObjectName("countdown")
+        self._countdown_frame.setFixedHeight(64)
+        self._countdown_frame.setVisible(False)
+        cd_layout = QHBoxLayout(self._countdown_frame)
+        cd_layout.setContentsMargins(12, 8, 12, 8)
+        cd_left = QVBoxLayout()
+        self._cd_label = QLabel("Restarting…")
+        self._cd_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._cd_timer_label = QLabel("05:00")
+        self._cd_timer_label.setStyleSheet(
+            "color: #f0a030; font-size: 20px; font-weight: bold;"
         )
-        self.last_check_label.grid(
-            row=1, column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
+        cd_left.addWidget(self._cd_label)
+        cd_left.addWidget(self._cd_timer_label)
+        cd_right = QVBoxLayout()
+        cd_right.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._cd_players_label = QLabel("Players")
+        self._cd_players_label.setStyleSheet("color: #666; font-size: 11px; text-align: right;")
+        self._cd_players_count = QLabel("–")
+        self._cd_players_count.setStyleSheet(
+            "color: #f0a030; font-size: 16px; font-weight: bold; text-align: right;"
         )
+        cd_right.addWidget(self._cd_players_label)
+        cd_right.addWidget(self._cd_players_count)
+        cd_layout.addLayout(cd_left)
+        cd_layout.addStretch()
+        cd_layout.addLayout(cd_right)
+        left_layout.addWidget(self._countdown_frame)
 
-        # Mod list — hidden until there are updates
-        self._mod_list_header = ctk.CTkLabel(
-            mf, text="Mods that need updating:",
-            font=ctk.CTkFont(size=12, weight="bold"),
+        # Mod updates card
+        mod_box = QGroupBox("Mod Updates")
+        mod_inner = QVBoxLayout(mod_box)
+        mod_inner.setContentsMargins(12, 16, 12, 12)
+        mod_inner.setSpacing(4)
+
+        mod_top = QHBoxLayout()
+        self._mod_status_label = QLabel("Not checked")
+        self._mod_status_label.setStyleSheet("color: #666;")
+        self._check_mods_btn = QPushButton("Check Now")
+        self._check_mods_btn.setFixedWidth(88)
+        self._check_mods_btn.clicked.connect(self._check_mods_threaded)
+        mod_top.addWidget(self._mod_status_label)
+        mod_top.addStretch()
+        mod_top.addWidget(self._check_mods_btn)
+        mod_inner.addLayout(mod_top)
+
+        self._mod_last_label = QLabel("Last checked: Never")
+        self._mod_last_label.setStyleSheet("color: #444; font-size: 11px;")
+        mod_inner.addWidget(self._mod_last_label)
+
+        self._mod_list_widget = QLabel("")
+        self._mod_list_widget.setWordWrap(True)
+        self._mod_list_widget.setStyleSheet("color: #aaa; font-size: 11px; margin-top: 4px;")
+        self._mod_list_widget.setVisible(False)
+        mod_inner.addWidget(self._mod_list_widget)
+
+        left_layout.addWidget(mod_box)
+
+        # Game update card
+        game_box = QGroupBox("Game Update")
+        game_inner = QVBoxLayout(game_box)
+        game_inner.setContentsMargins(12, 16, 12, 12)
+        game_inner.setSpacing(4)
+
+        game_top = QHBoxLayout()
+        self._server_update_label = QLabel("Not checked")
+        self._server_update_label.setStyleSheet("color: #666;")
+        self._check_server_update_btn = QPushButton("Check Now")
+        self._check_server_update_btn.setFixedWidth(88)
+        self._check_server_update_btn.clicked.connect(self._check_server_update_threaded)
+        game_top.addWidget(self._server_update_label)
+        game_top.addStretch()
+        game_top.addWidget(self._check_server_update_btn)
+        game_inner.addLayout(game_top)
+
+        self._server_update_last_label = QLabel("Last checked: Never")
+        self._server_update_last_label.setStyleSheet("color: #444; font-size: 11px;")
+        game_inner.addWidget(self._server_update_last_label)
+        left_layout.addWidget(game_box)
+
+        left_layout.addStretch()
+        splitter.addWidget(left)
+
+        # ── Right panel: activity log ────────────────────────────────
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        log_header = QHBoxLayout()
+        log_title = QLabel("ACTIVITY LOG")
+        log_title.setStyleSheet(
+            "color: #555; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;"
         )
-        self._mod_list_header.grid(
-            row=2, column=0, columnspan=3, padx=12, pady=(4, 2), sticky="w"
+        clear_log_btn = QPushButton("Clear")
+        clear_log_btn.setFixedWidth(60)
+        log_header.addWidget(log_title)
+        log_header.addStretch()
+        log_header.addWidget(clear_log_btn)
+        right_layout.addLayout(log_header)
+
+        self.activity_log = LogViewer()
+        clear_log_btn.clicked.connect(self.activity_log.clear_log)
+        right_layout.addWidget(self.activity_log)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        tab_layout.addWidget(splitter)
+        self.tabs.addTab(tab, "Server Control")
+
+    # ── RCON Console tab ──────────────────────────────────────────────
+
+    def _build_rcon_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        input_row = QHBoxLayout()
+        self.rcon_input = RconLineEdit()
+        self.rcon_input.setPlaceholderText(
+            'Enter RCON command  (e.g.  players  |  save  |  servermsg "text")…'
         )
-        self._mod_list_header.grid_remove()
+        self.rcon_input.returnPressed.connect(self._send_rcon_command)
+        send_btn = QPushButton("Send")
+        send_btn.setFixedWidth(72)
+        send_btn.clicked.connect(self._send_rcon_command)
+        input_row.addWidget(self.rcon_input)
+        input_row.addWidget(send_btn)
+        layout.addLayout(input_row)
 
-        self._mod_list_frame = ctk.CTkScrollableFrame(mf, height=100)
-        self._mod_list_frame.grid(
-            row=3, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="ew"
-        )
-        self._mod_list_frame.grid_columnconfigure(0, weight=1)
-        self._mod_list_frame.grid_remove()
+        self.rcon_output = LogViewer()
+        layout.addWidget(self.rcon_output)
 
-        # Server update section
-        suf = ctk.CTkFrame(parent)
-        suf.grid(row=3, column=0, sticky="ew", padx=5, pady=3)
-        suf.grid_columnconfigure(1, weight=1)
+        clear_btn = QPushButton("Clear Output")
+        clear_btn.setFixedWidth(110)
+        clear_btn.clicked.connect(self.rcon_output.clear_log)
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        bottom.addWidget(clear_btn)
+        layout.addLayout(bottom)
 
-        ctk.CTkLabel(
-            suf, text="Server Update:", font=ctk.CTkFont(weight="bold")
-        ).grid(row=0, column=0, padx=(12, 6), pady=(10, 4))
+        self.tabs.addTab(tab, "RCON Console")
 
-        self.server_update_status_label = ctk.CTkLabel(
-            suf, text="Not checked", text_color="gray"
-        )
-        self.server_update_status_label.grid(
-            row=0, column=1, padx=4, pady=(10, 4), sticky="w"
-        )
+    # ── Server Log tab ────────────────────────────────────────────────
 
-        ctk.CTkButton(
-            suf, text="Check Now", width=120,
-            command=self._check_server_update_threaded,
-        ).grid(row=0, column=2, padx=10, pady=(10, 4))
+    def _build_log_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        self.server_update_last_check_label = ctk.CTkLabel(
-            suf, text="Last checked: Never",
-            text_color="gray", font=ctk.CTkFont(size=12),
-        )
-        self.server_update_last_check_label.grid(
-            row=1, column=0, columnspan=3, padx=12, pady=(0, 4), sticky="w"
-        )
+        ctrl = QHBoxLayout()
+        self._log_file_label = QLabel("Not tailing any log file.")
+        self._log_file_label.setStyleSheet("color: #555; font-size: 11px;")
+        restart_tail_btn = QPushButton("Restart Tail")
+        restart_tail_btn.setFixedWidth(100)
+        restart_tail_btn.clicked.connect(self._restart_log_tail)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedWidth(60)
 
-        # Countdown
-        self.countdown_label = ctk.CTkLabel(
-            parent, text="",
-            text_color="#ff9900",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        )
-        self.countdown_label.grid(row=4, column=0, pady=4)
+        self._log_unconfigured = QWidget()
+        unconf_layout = QHBoxLayout(self._log_unconfigured)
+        unconf_layout.setContentsMargins(0, 0, 0, 0)
+        unconf_lbl = QLabel("No log directory configured.")
+        unconf_lbl.setStyleSheet("color: #555;")
+        open_settings_btn = QPushButton("Open Settings")
+        open_settings_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(3))
+        unconf_layout.addWidget(unconf_lbl)
+        unconf_layout.addWidget(open_settings_btn)
+        unconf_layout.addStretch()
 
-        # Activity log
-        ctk.CTkLabel(
-            parent, text="Activity Log:", font=ctk.CTkFont(weight="bold")
-        ).grid(row=5, column=0, padx=8, pady=(4, 0), sticky="w")
+        ctrl.addWidget(self._log_file_label)
+        ctrl.addStretch()
+        ctrl.addWidget(self._log_unconfigured)
+        ctrl.addWidget(restart_tail_btn)
+        ctrl.addWidget(clear_btn)
+        layout.addLayout(ctrl)
 
-        self.log_box = ctk.CTkTextbox(parent, wrap="word", state="disabled")
-        self.log_box.grid(row=6, column=0, sticky="nsew", padx=5, pady=(2, 8))
+        self.server_log = LogViewer()
+        clear_btn.clicked.connect(self.server_log.clear_log)
+        layout.addWidget(self.server_log)
 
-    # ---------- RCON Console tab (#4) ----------
+        self.tabs.addTab(tab, "Server Log")
+        self._update_log_tab_state()
 
-    def _build_rcon_tab(self, parent: ctk.CTkFrame):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
+    def _update_log_tab_state(self) -> None:
+        has_dir = bool(self.config.zomboid_dir)
+        self._log_file_label.setVisible(has_dir)
+        self._log_unconfigured.setVisible(not has_dir)
 
-        irow = ctk.CTkFrame(parent)
-        irow.grid(row=0, column=0, sticky="ew", padx=5, pady=(8, 4))
-        irow.grid_columnconfigure(0, weight=1)
+    # ── Settings tab ──────────────────────────────────────────────────
 
-        self.rcon_input = ctk.CTkEntry(
-            irow,
-            placeholder_text='Enter RCON command  (e.g.  players  |  save  |  servermsg "text")…',
-        )
-        self.rcon_input.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
-        self.rcon_input.bind("<Return>", lambda _e: self._send_rcon_command())
+    def _build_settings_tab(self) -> None:
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(12, 12, 12, 12)
+        outer_layout.setSpacing(8)
 
-        ctk.CTkButton(
-            irow, text="Send", width=80,
-            command=self._send_rcon_command,
-        ).grid(row=0, column=1, padx=(5, 10), pady=10)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        form_layout = QVBoxLayout(inner)
+        form_layout.setSpacing(16)
+        scroll.setWidget(inner)
+        outer_layout.addWidget(scroll, 1)
 
-        self.rcon_output = ctk.CTkTextbox(parent, wrap="word", state="disabled")
-        self.rcon_output.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 4))
+        self._settings_entries: dict[str, QLineEdit] = {}
 
-        ctk.CTkButton(
-            parent, text="Clear Output", width=120,
-            command=lambda: self._clear_textbox(self.rcon_output),
-        ).grid(row=2, column=0, pady=(0, 8))
+        def _add_group(title: str, rows: list[tuple[str, str, str]]) -> None:
+            box = QGroupBox(title)
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(12, 16, 12, 12)
+            box_layout.setSpacing(0)
+            for label_text, key, kind in rows:
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                lbl = QLabel(label_text)
+                lbl.setFixedWidth(200)
+                lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                lbl.setStyleSheet("color: #888;")
+                entry = QLineEdit()
+                if kind == "password":
+                    entry.setEchoMode(QLineEdit.EchoMode.Password)
+                entry.textChanged.connect(self._on_settings_changed)
+                self._settings_entries[key] = entry
+                row.addWidget(lbl)
+                row.addWidget(entry)
+                if kind == "dir":
+                    btn = QPushButton("Browse")
+                    btn.setFixedWidth(72)
+                    btn.clicked.connect(lambda _checked=False, e=entry: self._pick_dir(e))
+                    row.addWidget(btn)
+                elif kind == "file":
+                    btn = QPushButton("Browse")
+                    btn.setFixedWidth(72)
+                    btn.clicked.connect(lambda _checked=False, e=entry: self._pick_file(e))
+                    row.addWidget(btn)
+                else:
+                    spacer = QWidget()
+                    spacer.setFixedWidth(80)
+                    row.addWidget(spacer)
+                box_layout.addLayout(row)
+                # spacer between rows
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet("color: #252525;")
+                sep.setFixedHeight(1)
+                box_layout.addWidget(sep)
+            form_layout.addWidget(box)
 
-    # ---------- Server Log tab (#5) ----------
+        _add_group("Paths", [
+            ("PZ Server Folder:",   "server_dir",   "dir"),
+            ("Zomboid Log Folder:", "zomboid_dir",  "dir"),
+            ("RCON Executable:",    "rcon_path",    "file"),
+            ("SteamCMD Path:",      "steamcmd_path","file"),
+        ])
+        _add_group("Connection", [
+            ("Server Name:", "server_name", None),
+            ("Server IP:",   "server_ip",   None),
+            ("Password:",    "password",    "password"),
+        ])
 
-    def _build_log_tab(self, parent: ctk.CTkFrame):
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
+        # Schedule & Timing group (manual, not via _add_group — has combo boxes)
+        sched_box = QGroupBox("Schedule & Timing")
+        sched_layout = QVBoxLayout(sched_box)
+        sched_layout.setContentsMargins(12, 16, 12, 12)
+        sched_layout.setSpacing(0)
 
-        ctrl = ctk.CTkFrame(parent)
-        ctrl.grid(row=0, column=0, sticky="ew", padx=5, pady=(8, 4))
-        ctrl.grid_columnconfigure(0, weight=1)
-
-        self._log_file_label = ctk.CTkLabel(
-            ctrl, text="Not tailing any log file.",
-            text_color="gray", font=ctk.CTkFont(size=12),
-        )
-        self._log_file_label.grid(row=0, column=0, padx=10, pady=8, sticky="w")
-
-        ctk.CTkButton(
-            ctrl, text="Restart Tail", width=110,
-            command=self._restart_log_tail,
-        ).grid(row=0, column=1, padx=5, pady=8)
-
-        ctk.CTkButton(
-            ctrl, text="Clear", width=80,
-            command=lambda: self._clear_textbox(self.server_log_box),
-        ).grid(row=0, column=2, padx=(0, 10), pady=8)
-
-        self.server_log_box = ctk.CTkTextbox(parent, wrap="word", state="disabled")
-        self.server_log_box.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 8))
-
-    # ---------- Settings tab ----------
-
-    def _build_settings_tab(self, parent: ctk.CTkFrame):
-        parent.grid_columnconfigure(1, weight=1)
-
-        base_rows = [
-            ("PZ Server Folder:",            "server_dir",              "dir"),
-            ("Zomboid Log Folder:",          "zomboid_dir",             "dir"),
-            ("RCON Executable:",             "rcon_path",               "file"),
-            ("Server Name:",                 "server_name",             None),
-            ("Server IP:",                   "server_ip",               None),
-            ("Password:",                    "password",                "password"),
-            ("Check Interval (min):",        "check_interval",          None),
-            ("SteamCMD Path:",               "steamcmd_path",           "file"),
-            ("Server Update Interval (min):", "server_update_interval", None),
-            ("SteamCMD Timeout (sec):",      "steamcmd_timeout",        None),
-        ]
-
-        self._settings_entries: dict[str, ctk.CTkEntry] = {}
-
-        for i, (label, key, kind) in enumerate(base_rows):
-            ctk.CTkLabel(parent, text=label).grid(
-                row=i, column=0, padx=(10, 5), pady=8, sticky="e"
-            )
-            entry = ctk.CTkEntry(parent, show="*" if kind == "password" else "")
-            entry.grid(row=i, column=1, padx=5, pady=8, sticky="ew")
+        def _timing_row(label_text: str, key: str) -> None:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(200)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setStyleSheet("color: #888;")
+            entry = QLineEdit()
+            entry.textChanged.connect(self._on_settings_changed)
             self._settings_entries[key] = entry
+            spacer = QWidget()
+            spacer.setFixedWidth(80)
+            row.addWidget(lbl)
+            row.addWidget(entry)
+            row.addWidget(spacer)
+            sched_layout.addLayout(row)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("color: #252525;")
+            sep.setFixedHeight(1)
+            sched_layout.addWidget(sep)
 
-            if kind == "dir":
-                ctk.CTkButton(
-                    parent, text="Browse", width=80,
-                    command=lambda e=entry: self._pick_dir(e),
-                ).grid(row=i, column=2, padx=(5, 10), pady=8)
-            elif kind == "file":
-                ctk.CTkButton(
-                    parent, text="Browse", width=80,
-                    command=lambda e=entry: self._pick_file(e),
-                ).grid(row=i, column=2, padx=(5, 10), pady=8)
+        _timing_row("Check Interval (min):",         "check_interval")
+        _timing_row("Server Update Interval (min):", "server_update_interval")
+        _timing_row("SteamCMD Timeout (sec):",       "steamcmd_timeout")
 
-        # --- Scheduled daily restart (#14) ---
-        srow = len(base_rows)
-        ctk.CTkLabel(parent, text="Scheduled Restart:").grid(
-            row=srow, column=0, padx=(10, 5), pady=8, sticky="e"
-        )
-
-        sched_inner = ctk.CTkFrame(parent, fg_color="transparent")
-        sched_inner.grid(row=srow, column=1, padx=5, pady=8, sticky="w")
-
-        hours   = ["Disabled"] + [f"{h:02d}" for h in range(24)]
+        # Scheduled restart row
+        sched_row = QHBoxLayout()
+        sched_row.setSpacing(8)
+        sched_lbl = QLabel("Scheduled Restart:")
+        sched_lbl.setFixedWidth(200)
+        sched_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sched_lbl.setStyleSheet("color: #888;")
+        hours = ["Disabled"] + [f"{h:02d}" for h in range(24)]
         minutes = [f"{m:02d}" for m in range(0, 60, 5)]
+        self._sched_hour = QComboBox()
+        self._sched_hour.addItems(hours)
+        self._sched_hour.setFixedWidth(90)
+        self._sched_hour.currentTextChanged.connect(self._on_settings_changed)
+        colon = QLabel(":")
+        colon.setFixedWidth(8)
+        colon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sched_minute = QComboBox()
+        self._sched_minute.addItems(minutes)
+        self._sched_minute.setFixedWidth(72)
+        self._sched_minute.currentTextChanged.connect(self._on_settings_changed)
+        hint = QLabel("24 h — 'Disabled' to turn off")
+        hint.setStyleSheet("color: #444; font-size: 11px;")
+        sched_row.addWidget(sched_lbl)
+        sched_row.addWidget(self._sched_hour)
+        sched_row.addWidget(colon)
+        sched_row.addWidget(self._sched_minute)
+        sched_row.addWidget(hint)
+        sched_row.addStretch()
+        sched_layout.addLayout(sched_row)
+        form_layout.addWidget(sched_box)
+        form_layout.addStretch()
 
-        self._sched_hour = ctk.CTkOptionMenu(sched_inner, values=hours, width=100)
-        self._sched_hour.grid(row=0, column=0, padx=(0, 4))
+        # Save row
+        save_row = QHBoxLayout()
+        self._unsaved_label = QLabel("Unsaved changes")
+        self._unsaved_label.setStyleSheet("color: #f0a030; font-size: 11px;")
+        self._unsaved_label.setVisible(False)
+        self._save_btn = QPushButton("Save Configuration")
+        self._save_btn.setFixedWidth(160)
+        self._save_btn.clicked.connect(self._save_config)
+        save_row.addWidget(self._unsaved_label)
+        save_row.addStretch()
+        save_row.addWidget(self._save_btn)
+        outer_layout.addLayout(save_row)
 
-        ctk.CTkLabel(sched_inner, text=":").grid(row=0, column=1, padx=2)
+        self.tabs.addTab(outer, "Settings")
 
-        self._sched_minute = ctk.CTkOptionMenu(sched_inner, values=minutes, width=80)
-        self._sched_minute.grid(row=0, column=2, padx=(4, 10))
+    # ------------------------------------------------------------------
+    # System tray
+    # ------------------------------------------------------------------
 
-        ctk.CTkLabel(
-            sched_inner,
-            text="24 h — choose 'Disabled' to turn off",
-            text_color="gray", font=ctk.CTkFont(size=11),
-        ).grid(row=0, column=3)
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("System tray not available — close button will exit normally.")
+            return
 
-        ctk.CTkButton(
-            parent, text="Save Configuration", command=self._save_config
-        ).grid(row=srow + 1, column=0, columnspan=3, pady=20)
+        self._tray = QSystemTrayIcon(_make_icon(), parent=self)
+        self._tray.setToolTip("PZ Server Manager")
+
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Show")
+        show_action.triggered.connect(self._show_from_tray)
+        quit_action = tray_menu.addAction("Quit")
+        quit_action.triggered.connect(self._quit_from_tray)
+        self._tray.setContextMenu(tray_menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "_tray") and self._tray.isVisible():
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "PZ Server Manager",
+                "Running in background. Right-click the tray icon to quit.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+        else:
+            event.accept()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._stop_log_tail()
+        QApplication.instance().quit()
 
     # ------------------------------------------------------------------
     # Config helpers
     # ------------------------------------------------------------------
 
-    def _load_config_into_ui(self):
+    def _load_config_into_ui(self) -> None:
         cfg = self.config
         e = self._settings_entries
 
-        def put(key: str, val):
-            e[key].delete(0, "end")
-            e[key].insert(0, str(val))
+        def put(key: str, val) -> None:
+            e[key].blockSignals(True)
+            e[key].setText(str(val))
+            e[key].blockSignals(False)
 
-        put("server_dir",              cfg.server_dir)
-        put("zomboid_dir",             cfg.zomboid_dir)
-        put("rcon_path",               cfg.rcon_path)
-        put("server_name",             cfg.server_name)
-        put("server_ip",               cfg.server_ip)
-        put("password",                cfg.password)
-        put("check_interval",          cfg.check_interval)
-        put("steamcmd_path",           cfg.steamcmd_path)
-        put("server_update_interval",  cfg.server_update_interval)
-        put("steamcmd_timeout",        cfg.steamcmd_timeout)
+        put("server_dir",             cfg.server_dir)
+        put("zomboid_dir",            cfg.zomboid_dir)
+        put("rcon_path",              cfg.rcon_path)
+        put("server_name",            cfg.server_name)
+        put("server_ip",              cfg.server_ip)
+        put("password",               cfg.password)
+        put("check_interval",         str(cfg.check_interval))
+        put("steamcmd_path",          cfg.steamcmd_path)
+        put("server_update_interval", str(cfg.server_update_interval))
+        put("steamcmd_timeout",       str(cfg.steamcmd_timeout))
 
         if cfg.last_update:
-            self.last_check_label.configure(text=f"Last checked: {cfg.last_update}")
-
+            self._mod_last_label.setText(f"Last checked: {cfg.last_update}")
         if cfg.last_server_update_check:
-            self.server_update_last_check_label.configure(
-                text=f"Last checked: {cfg.last_server_update_check}"
+            self._server_update_last_label.setText(
+                f"Last checked: {cfg.last_server_update_check}"
             )
 
-        # Restore scheduled restart dropdowns
+        # Scheduled restart dropdowns
         sched = cfg.scheduled_restart.strip()
+        self._sched_hour.blockSignals(True)
+        self._sched_minute.blockSignals(True)
         if sched:
             try:
                 sh, sm = sched.split(":")
                 sm_rounded = f"{(int(sm) // 5) * 5:02d}"
-                self._sched_hour.set(sh)
-                self._sched_minute.set(sm_rounded)
+                idx_h = self._sched_hour.findText(sh)
+                idx_m = self._sched_minute.findText(sm_rounded)
+                if idx_h >= 0:
+                    self._sched_hour.setCurrentIndex(idx_h)
+                if idx_m >= 0:
+                    self._sched_minute.setCurrentIndex(idx_m)
             except ValueError:
-                self._sched_hour.set("Disabled")
+                self._sched_hour.setCurrentIndex(0)
         else:
-            self._sched_hour.set("Disabled")
+            self._sched_hour.setCurrentIndex(0)
+        self._sched_hour.blockSignals(False)
+        self._sched_minute.blockSignals(False)
 
-    def _save_config(self):
+        self._settings_dirty = False
+        self._unsaved_label.setVisible(False)
+        self._update_status_bar()
+
+    def _on_settings_changed(self) -> None:
+        if not self._settings_dirty:
+            self._settings_dirty = True
+            self._unsaved_label.setVisible(True)
+
+    def _save_config(self) -> None:
         old_zomboid_dir = self.config.zomboid_dir
         e = self._settings_entries
 
-        self.config.server_dir    = e["server_dir"].get()
-        self.config.zomboid_dir   = e["zomboid_dir"].get()
-        self.config.rcon_path     = e["rcon_path"].get()
-        self.config.server_name   = e["server_name"].get()
-        self.config.server_ip     = e["server_ip"].get()
-        self.config.password      = e["password"].get()
+        self.config.server_dir    = e["server_dir"].text()
+        self.config.zomboid_dir   = e["zomboid_dir"].text()
+        self.config.rcon_path     = e["rcon_path"].text()
+        self.config.server_name   = e["server_name"].text()
+        self.config.server_ip     = e["server_ip"].text()
+        self.config.password      = e["password"].text()
         try:
-            self.config.check_interval = int(e["check_interval"].get())
+            self.config.check_interval = int(e["check_interval"].text())
         except ValueError:
             self.config.check_interval = 60
-        self.config.steamcmd_path = e["steamcmd_path"].get()
+        self.config.steamcmd_path = e["steamcmd_path"].text()
         try:
-            self.config.server_update_interval = int(e["server_update_interval"].get())
+            self.config.server_update_interval = int(e["server_update_interval"].text())
         except ValueError:
             self.config.server_update_interval = 60
         try:
-            self.config.steamcmd_timeout = int(e["steamcmd_timeout"].get())
+            self.config.steamcmd_timeout = int(e["steamcmd_timeout"].text())
         except ValueError:
             self.config.steamcmd_timeout = 600
 
-        hour_val = self._sched_hour.get()
+        hour_val = self._sched_hour.currentText()
         self.config.scheduled_restart = (
             "" if hour_val == "Disabled"
-            else f"{hour_val}:{self._sched_minute.get()}"
+            else f"{hour_val}:{self._sched_minute.currentText()}"
         )
 
         self.config.save()
+        self._settings_dirty = False
+        self._unsaved_label.setVisible(False)
         self._log("Configuration saved.")
+        self._update_status_bar()
+        self._update_log_tab_state()
 
-        # Restart log tail if the directory changed
         if self.config.zomboid_dir != old_zomboid_dir:
             self._restart_log_tail()
 
     # ------------------------------------------------------------------
-    # Server control
+    # Server status
     # ------------------------------------------------------------------
 
-    def _check_server_status_threaded(self):
-        self.status_label.configure(text="Checking…", text_color="orange")
+    def _check_server_status_threaded(self) -> None:
+        self._status_text.setText("Checking…")
+        self._status_dot.setStyleSheet("color: #f0a030; font-size: 18px;")
         threading.Thread(target=self._check_server_status, daemon=True).start()
 
     def _check_server_status(self) -> bool:
         try:
             running = self.server.is_running()
         except Exception as exc:
-            self.after(0, lambda: self.status_label.configure(
-                text=f"Error: {exc}", text_color="red"
-            ))
+            self._invoke(lambda: self._set_status_error(str(exc)))
             return False
-
-        if running:
-            self.after(0, lambda: self.status_label.configure(
-                text="Running  ●", text_color="#22cc55"
-            ))
-        else:
-            self.after(0, lambda: self.status_label.configure(
-                text="Stopped  ●", text_color="#cc2222"
-            ))
+        self._invoke(lambda r=running: self._set_status(r))
         return running
 
-    def _start_server(self):
+    def _set_status(self, running: bool) -> None:
+        self._server_running = running
+        if running:
+            self._status_dot.setStyleSheet(
+                "color: #3ddc84; font-size: 18px;"
+            )
+            self._status_text.setText("Running")
+        else:
+            self._status_dot.setStyleSheet(
+                "color: #e05252; font-size: 18px;"
+            )
+            self._status_text.setText("Stopped")
+        self._update_status_bar()
+
+    def _set_status_error(self, msg: str) -> None:
+        self._status_dot.setStyleSheet("color: #e05252; font-size: 18px;")
+        self._status_text.setText("Error")
+        self._log(f"Status check error: {msg}")
+
+    def _update_status_bar(self) -> None:
+        status = self._status_text.text()
+        color = "#3ddc84" if status == "Running" else "#e05252" if status == "Stopped" else "#666"
+        self._sb_server.setText(f"● {status}")
+        self._sb_server.setStyleSheet(f"color: {color}; margin-right: 16px;")
+        name = self.config.server_name or "–"
+        ip   = self.config.server_ip   or "–"
+        self._sb_info.setText(f"{name} @ {ip}")
+
+    # ------------------------------------------------------------------
+    # Server control buttons (disable during async, re-enable in finally)
+    # ------------------------------------------------------------------
+
+    def _set_control_buttons(self, enabled: bool) -> None:
+        for btn in (self._start_btn, self._stop_btn, self._restart_btn):
+            btn.setEnabled(enabled)
+
+    def _start_server(self) -> None:
         self._log("Checking for existing server process…")
+        self._set_control_buttons(False)
 
         def _do():
             try:
                 if self.server.is_running():
-                    self.after(0, lambda: self._log(
-                        "Server is already running — not starting a second instance."
-                    ))
-                    self.after(0, lambda: self.status_label.configure(
-                        text="Running  ●", text_color="#22cc55"
-                    ))
+                    self._invoke(lambda: self._log("Server is already running."))
+                    self._invoke(lambda: self._set_status(True))
                     return
                 self.server.start()
-                self.after(0, lambda: self._log("Server is launching…"))
-                self.after(0, lambda: self.status_label.configure(
-                    text="Starting…", text_color="orange"
-                ))
-                self.after(5000, self._check_server_status_threaded)
+                self._invoke(lambda: self._log("Server is launching…"))
+                self._invoke(lambda: self._status_text.setText("Starting…"))
+                QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self.after(0, lambda: self._log(f"Start failed: {exc}"))
+                self._invoke(lambda: self._log(f"Start failed: {exc}"))
+            finally:
+                self._invoke(lambda: self._set_control_buttons(True))
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _stop_server(self):
+    def _stop_server(self) -> None:
         self._log("Sending stop command…")
+        self._set_control_buttons(False)
 
         def _do():
             try:
                 self.server.stop()
-                self.after(0, lambda: self._log("Stop command sent."))
-                self.after(6000, self._check_server_status_threaded)
+                self._invoke(lambda: self._log("Stop command sent."))
+                QTimer.singleShot(6000, self._check_server_status_threaded)
             except Exception as exc:
-                self.after(0, lambda: self._log(f"Stop failed: {exc}"))
+                self._invoke(lambda: self._log(f"Stop failed: {exc}"))
+            finally:
+                self._invoke(lambda: self._set_control_buttons(True))
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _restart_server(self):
+    def _restart_server(self) -> None:
         self._log("Restarting server…")
+        self._set_control_buttons(False)
 
         def _do():
+            import time as _time
             try:
                 self.server.stop()
-                import time as _time
                 _time.sleep(6)
                 self.server.start()
-                self.after(0, lambda: self._log("Server restarted."))
-                self.after(5000, self._check_server_status_threaded)
+                self._invoke(lambda: self._log("Server restarted."))
+                QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self.after(0, lambda: self._log(f"Restart failed: {exc}"))
+                self._invoke(lambda: self._log(f"Restart failed: {exc}"))
+            finally:
+                self._invoke(lambda: self._set_control_buttons(True))
 
         threading.Thread(target=_do, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Auto-refresh server status (#6)
+    # Auto-refresh server status
     # ------------------------------------------------------------------
 
-    def _start_status_poll(self):
-        self._poll_status_job = self.after(_STATUS_POLL_MS, self._poll_status)
-
-    def _poll_status(self):
-        threading.Thread(target=self._check_server_status, daemon=True).start()
-        self._poll_status_job = self.after(_STATUS_POLL_MS, self._poll_status)
+    def _start_status_poll(self) -> None:
+        self._poll_status_job = QTimer(self)
+        self._poll_status_job.setInterval(_STATUS_POLL_MS)
+        self._poll_status_job.timeout.connect(
+            lambda: threading.Thread(
+                target=self._check_server_status, daemon=True
+            ).start()
+        )
+        self._poll_status_job.start()
 
     # ------------------------------------------------------------------
-    # Scheduled daily restart (#14)
+    # Scheduled daily restart
     # ------------------------------------------------------------------
 
-    def _start_sched_poll(self):
-        self._sched_job = self.after(_SCHED_POLL_MS, self._check_scheduled_restart)
+    def _start_sched_poll(self) -> None:
+        self._sched_job = QTimer(self)
+        self._sched_job.setInterval(_SCHED_POLL_MS)
+        self._sched_job.timeout.connect(self._check_scheduled_restart)
+        self._sched_job.start()
 
-    def _check_scheduled_restart(self):
+    def _check_scheduled_restart(self) -> None:
         sched = self.config.scheduled_restart.strip()
-        if sched:
-            try:
-                sh, sm = map(int, sched.split(":"))
-                now = datetime.now()
-                today = now.date()
-                if (
-                    now.hour == sh
-                    and now.minute == sm
-                    and self._last_sched_restart_date != today
-                ):
-                    self._last_sched_restart_date = today
-                    self._log(f"Scheduled daily restart at {sched} triggered.")
-                    self._restart_server()
-            except ValueError:
-                pass
-        self._sched_job = self.after(_SCHED_POLL_MS, self._check_scheduled_restart)
+        if not sched:
+            return
+        try:
+            sh, sm = map(int, sched.split(":"))
+            now = datetime.now()
+            today = now.date()
+            if (
+                now.hour == sh
+                and now.minute == sm
+                and self._last_sched_restart_date != today
+            ):
+                self._last_sched_restart_date = today
+                self._log(f"Scheduled daily restart at {sched} triggered.")
+                self._restart_server()
+        except ValueError:
+            pass
 
     # ------------------------------------------------------------------
-    # Check cycle helpers (shared by mod + server update pipelines)
+    # Check cycle helpers
     # ------------------------------------------------------------------
 
     def _resume_check_cycle(
         self, last_ts: str, interval_min: int, check_fn, label: str
-    ) -> str:
-        """
-        Schedule the first run of a periodic check cycle on startup.
-        Returns the after() job ID.
+    ) -> QTimer:
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(check_fn)
 
-          - Never run  → first check in 10 s
-          - Overdue    → check in 10 s
-          - Time remaining → schedule for the remaining portion of the interval
-        """
         if not last_ts:
-            self._log(
-                f"No previous {label} check found — scheduling first check in 10 s."
-            )
-            return self.after(10_000, check_fn)
+            self._log(f"No previous {label} check — first check in 10 s.")
+            timer.start(10_000)
+            return timer
+
         try:
             last = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
             elapsed = (datetime.now() - last).total_seconds()
             remaining = interval_min * 60 - elapsed
             if remaining <= 30:
-                self._log(f"{label} check is overdue — checking in 10 s.")
-                return self.after(10_000, check_fn)
-            mins, secs = divmod(int(remaining), 60)
-            self._log(
-                f"Resuming {label} check schedule — next check in {mins}m {secs}s."
-            )
-            return self.after(int(remaining * 1000), check_fn)
+                self._log(f"{label} check overdue — checking in 10 s.")
+                timer.start(10_000)
+            else:
+                mins, secs = divmod(int(remaining), 60)
+                self._log(f"Resuming {label} schedule — next check in {mins}m {secs}s.")
+                timer.start(int(remaining * 1000))
         except ValueError:
-            return self.after(10_000, check_fn)
+            timer.start(10_000)
+
+        return timer
 
     # ------------------------------------------------------------------
-    # Mod update checking (#1 & #3 — timer resumed on startup)
+    # Mod update pipeline
     # ------------------------------------------------------------------
 
-    def _resume_auto_check(self):
+    def _resume_auto_check(self) -> None:
         self._auto_check_job = self._resume_check_cycle(
             self.config.last_update,
             self.config.check_interval,
@@ -606,58 +1202,63 @@ class App(ctk.CTk):
             "mod",
         )
 
-    def _check_mods_threaded(self):
-        # Cancel any pending auto-check to prevent double-firing on manual trigger
+    def _check_mods_threaded(self) -> None:
+        cfg = self.config
+        if not (cfg.rcon_path and cfg.server_ip and cfg.password):
+            self._log("RCON not configured — open Settings to get started.")
+            self._schedule_next_check()
+            return
+        if self._server_running is None:
+            self._log("Server status not yet known — retrying mod check in 30 s.")
+            QTimer.singleShot(30_000, self._check_mods_threaded)
+            return
+        if not self._server_running:
+            self._log("Server is not running — skipping mod check.")
+            self._schedule_next_check()
+            return
         if self._auto_check_job:
-            self.after_cancel(self._auto_check_job)
-            self._auto_check_job = None
-
-        self.mod_status_label.configure(text="Sending RCON command…", text_color="orange")
+            self._auto_check_job.stop()
+        self._mod_status_label.setText("Sending RCON command…")
+        self._mod_status_label.setStyleSheet("color: #f0a030;")
         self._log("Checking for mod updates…")
         threading.Thread(target=self._check_mods_worker, daemon=True).start()
 
-    def _check_mods_worker(self):
+    def _check_mods_worker(self) -> None:
         try:
             self.server.check_mods_need_update()
         except Exception as exc:
-            self.after(0, lambda: self._log(f"RCON error: {exc}"))
-            self.after(0, lambda: self.mod_status_label.configure(
-                text=f"RCON error: {exc}", text_color="red"
-            ))
+            self._invoke(lambda: self._log(f"RCON error: {exc}"))
+            self._invoke(lambda: self._set_mod_status(f"RCON error: {exc}", "error"))
             return
 
         zomboid_dir = self.config.zomboid_dir
         if not zomboid_dir:
-            self.after(0, lambda: self.mod_status_label.configure(
-                text="Zomboid log folder not set.", text_color="red"
-            ))
+            self._invoke(lambda: self._set_mod_status("Zomboid log folder not set.", "error"))
             return
 
         parser = LogParser(zomboid_dir)
         log_file = parser.find_latest_log()
         if not log_file:
-            self.after(0, lambda: self.mod_status_label.configure(
-                text="No log file found in the specified folder.", text_color="red"
-            ))
+            self._invoke(lambda: self._set_mod_status("No log file found.", "error"))
             return
 
-        self.after(0, lambda: self._log(f"Monitoring: {os.path.basename(log_file)}"))
-        self.after(0, lambda: self.mod_status_label.configure(
-            text="Waiting for server response in log…", text_color="orange"
-        ))
+        self._invoke(lambda: self._log(f"Monitoring: {os.path.basename(log_file)}"))
+        self._invoke(lambda: self._set_mod_status("Waiting for log response…", "warn"))
 
         status, mod_names = parser.monitor_for_mod_status(log_file)
 
-        # Enrich raw workshop IDs with friendly names from the server config
         if status == "needs_update" and mod_names:
             mod_map = parser.load_server_mod_map(
                 self.config.server_dir, self.config.server_name
             )
             if mod_map:
                 mod_names = [
-                    f"{mod_map[e.replace('Workshop ID: ', '')]}  "
-                    f"(Workshop: {e.replace('Workshop ID: ', '')})"
-                    if e.replace("Workshop ID: ", "") in mod_map else e
+                    (
+                        f"{mod_map[e.replace('Workshop ID: ', '')]}  "
+                        f"(Workshop: {e.replace('Workshop ID: ', '')})"
+                        if e.replace("Workshop ID: ", "") in mod_map
+                        else e
+                    )
                     for e in mod_names
                 ]
 
@@ -666,50 +1267,40 @@ class App(ctk.CTk):
         self.config.save()
 
         if status == "needs_update":
-            self.after(0, lambda: self._on_mods_need_update(mod_names, now))
+            self._invoke(lambda: self._on_mods_need_update(mod_names, now))
         elif status == "up_to_date":
-            self.after(0, lambda: self._on_mods_up_to_date(now))
+            self._invoke(lambda: self._on_mods_up_to_date(now))
         else:
-            self.after(0, lambda: self._log(
-                "Timed out waiting for mod status in log (300 s)."
-            ))
-            self.after(0, lambda: self.mod_status_label.configure(
-                text="Timed out — no response in log.", text_color="red"
-            ))
+            self._invoke(lambda: self._log("Timed out waiting for mod status (300 s)."))
+            self._invoke(lambda: self._set_mod_status("Timed out — no response.", "error"))
 
-    def _on_mods_need_update(self, mod_names: list[str], timestamp: str):
-        self.mod_status_label.configure(text="Updates available!", text_color="orange")
-        self.last_check_label.configure(text=f"Last checked: {timestamp}")
+    def _set_mod_status(self, text: str, level: str = "default") -> None:
+        colors = {"error": "#e05252", "warn": "#f0a030", "success": "#3ddc84", "default": "#888"}
+        self._mod_status_label.setText(text)
+        self._mod_status_label.setStyleSheet(f"color: {colors.get(level, '#888')};")
 
-        for widget in self._mod_list_frame.winfo_children():
-            widget.destroy()
-
+    def _on_mods_need_update(self, mod_names: list[str], timestamp: str) -> None:
+        self._set_mod_status("Updates available!", "warn")
+        self._mod_last_label.setText(f"Last checked: {timestamp}")
         if mod_names:
-            self._mod_list_header.grid()
-            self._mod_list_frame.grid()
+            self._mod_list_widget.setText("\n".join(f"• {n}" for n in mod_names))
+            self._mod_list_widget.setVisible(True)
             for name in mod_names:
-                ctk.CTkLabel(
-                    self._mod_list_frame, text=f"  •  {name}", anchor="w"
-                ).grid(sticky="ew", padx=6, pady=2)
                 self._log(f"  Mod: {name}")
         else:
-            self._mod_list_header.grid_remove()
-            self._mod_list_frame.grid_remove()
-            self._log("  (mod names could not be extracted from log)")
-
+            self._mod_list_widget.setVisible(False)
         self._log("Mods need updating — starting 5-minute restart countdown.")
         self._start_restart_countdown()
 
-    def _on_mods_up_to_date(self, timestamp: str):
-        self.mod_status_label.configure(text="All mods up to date  ✓", text_color="#22cc55")
-        self.last_check_label.configure(text=f"Last checked: {timestamp}")
-        self._mod_list_header.grid_remove()
-        self._mod_list_frame.grid_remove()
+    def _on_mods_up_to_date(self, timestamp: str) -> None:
+        self._set_mod_status("All mods up to date  ✓", "success")
+        self._mod_last_label.setText(f"Last checked: {timestamp}")
+        self._mod_list_widget.setVisible(False)
         self._log("All mods are up to date.")
         self._schedule_next_check()
 
     # ------------------------------------------------------------------
-    # Restart countdown with in-game broadcasts (#2)
+    # Restart countdown
     # ------------------------------------------------------------------
 
     def _start_restart_countdown(
@@ -718,40 +1309,38 @@ class App(ctk.CTk):
         broadcast_messages: Optional[dict] = None,
         action=None,
         post_fn=None,
-    ):
+    ) -> None:
         self._countdown_remaining = seconds
         self._countdown_active = True
-        self._countdown_broadcast_messages = (
-            broadcast_messages if broadcast_messages is not None else _BROADCAST_AT
-        )
-        self._countdown_action = action if action is not None else self._restart_server
-        self._countdown_post_fn = (
-            post_fn if post_fn is not None else self._schedule_next_check
-        )
+        self._countdown_broadcast_messages = broadcast_messages or _BROADCAST_AT
+        self._countdown_action = action or self._restart_server
+        self._countdown_post_fn = post_fn or self._schedule_next_check
+
+        # Show banner, hide spacer
+        self._countdown_spacer.setVisible(False)
+        self._countdown_frame.setVisible(True)
+
         self._tick_countdown()
 
-    def _tick_countdown(self):
+    def _tick_countdown(self) -> None:
         if not self._countdown_active:
             return
 
         remaining = self._countdown_remaining
         if remaining <= 0:
             self._countdown_active = False
-            self.countdown_label.configure(text="")
+            self._countdown_frame.setVisible(False)
+            self._countdown_spacer.setVisible(True)
             self._log("Restart countdown finished.")
-            action = self._countdown_action or self._restart_server
+            action  = self._countdown_action or self._restart_server
             post_fn = self._countdown_post_fn or self._schedule_next_check
             action()
             post_fn()
             return
 
         mins, secs = divmod(remaining, 60)
-        self.countdown_label.configure(
-            text=f"Restarting in  {mins:02d}:{secs:02d}"
-            f"  — checking player count each minute"
-        )
+        self._cd_timer_label.setText(f"{mins:02d}:{secs:02d}")
 
-        # Broadcast in-game warnings at key thresholds
         msgs = self._countdown_broadcast_messages or _BROADCAST_AT
         if remaining in msgs:
             msg = msgs[remaining]
@@ -760,45 +1349,44 @@ class App(ctk.CTk):
                 target=lambda m=msg: self._broadcast_safe(m), daemon=True
             ).start()
 
-        # Player count check every full minute
         if remaining % 60 == 0:
             threading.Thread(target=self._maybe_early_restart, daemon=True).start()
 
         self._countdown_remaining -= 1
-        self.after(1000, self._tick_countdown)
+        QTimer.singleShot(1000, self._tick_countdown)
 
-    def _broadcast_safe(self, message: str):
+    def _broadcast_safe(self, message: str) -> None:
         try:
             self.server.broadcast(message)
         except Exception as exc:
-            self.after(0, lambda: self._log(f"Broadcast failed: {exc}"))
+            self._invoke(lambda: self._log(f"Broadcast failed: {exc}"))
 
-    def _maybe_early_restart(self):
+    def _maybe_early_restart(self) -> None:
         try:
             count = self.server.get_player_count()
-            self.after(0, lambda: self._log(f"Players currently online: {count}"))
+            self._invoke(lambda: self._log(f"Players currently online: {count}"))
+            self._invoke(lambda: self._cd_players_count.setText(str(count)))
             if count == 0:
-                self.after(0, lambda: self._log(
-                    "No players online — triggering early restart."
-                ))
+                self._invoke(lambda: self._log("No players online — triggering early restart."))
                 self._countdown_remaining = 0
         except Exception as exc:
-            self.after(0, lambda: self._log(f"Player count check failed: {exc}"))
+            self._invoke(lambda: self._log(f"Player count check failed: {exc}"))
 
-    def _schedule_next_check(self):
+    def _schedule_next_check(self) -> None:
         if self._auto_check_job:
-            self.after_cancel(self._auto_check_job)
+            self._auto_check_job.stop()
         interval_ms = self.config.check_interval * 60 * 1000
-        self._auto_check_job = self.after(interval_ms, self._check_mods_threaded)
-        self._log(
-            f"Next mod check scheduled in {self.config.check_interval} minute(s)."
-        )
+        self._auto_check_job = QTimer(self)
+        self._auto_check_job.setSingleShot(True)
+        self._auto_check_job.timeout.connect(self._check_mods_threaded)
+        self._auto_check_job.start(interval_ms)
+        self._log(f"Next mod check in {self.config.check_interval} minute(s).")
 
     # ------------------------------------------------------------------
-    # Server update pipeline (mirrors mod update pipeline)
+    # Server update pipeline
     # ------------------------------------------------------------------
 
-    def _resume_server_update_check(self):
+    def _resume_server_update_check(self) -> None:
         self._server_update_check_job = self._resume_check_cycle(
             self.config.last_server_update_check,
             self.config.server_update_interval,
@@ -806,67 +1394,44 @@ class App(ctk.CTk):
             "server update",
         )
 
-    def _check_server_update_threaded(self):
-        # Validate SteamCMD path before doing anything
+    def _check_server_update_threaded(self) -> None:
+        if not self.config.server_dir:
+            self._log("Server folder not configured — open Settings to get started.")
+            return
         if not self.config.steamcmd_path or not os.path.isfile(self.config.steamcmd_path):
-            self._log(
-                "SteamCMD path not configured or not found — set it in Settings."
-            )
+            self._log("SteamCMD path not configured or not found — set it in Settings.")
             return
-
-        # Skip if a countdown is already running
         if self._countdown_active:
-            self._log(
-                "Skipping server update check — restart already in progress."
-            )
-            interval_ms = self.config.server_update_interval * 60 * 1000
-            self._server_update_check_job = self.after(
-                interval_ms, self._check_server_update_threaded
-            )
+            self._log("Skipping server update check — restart already in progress.")
+            self._schedule_next_server_update_check()
             return
-
-        # Cancel any pending scheduled check to prevent double-firing
         if self._server_update_check_job:
-            self.after_cancel(self._server_update_check_job)
-            self._server_update_check_job = None
-
-        self.server_update_status_label.configure(
-            text="Checking…", text_color="orange"
-        )
+            self._server_update_check_job.stop()
+        self._server_update_label.setText("Checking…")
+        self._server_update_label.setStyleSheet("color: #f0a030;")
         self._log("Checking for server updates…")
         threading.Thread(target=self._check_server_update_worker, daemon=True).start()
 
-    def _check_server_update_worker(self):
+    def _check_server_update_worker(self) -> None:
         result = self._server_update_checker.update_needed()
-
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.config.last_server_update_check = now
         self.config.save()
 
         if result is True:
-            self.after(0, lambda: self._on_server_update_needed(now))
+            self._invoke(lambda: self._on_server_update_needed(now))
         elif result is False:
-            self.after(0, lambda: self._on_server_up_to_date(now))
+            self._invoke(lambda: self._on_server_up_to_date(now))
         else:
-            # Check failed (None) — log and reschedule
-            self.after(0, lambda: self.server_update_status_label.configure(
-                text="Check failed — see log", text_color="red"
-            ))
-            self.after(0, lambda: self.server_update_last_check_label.configure(
-                text=f"Last checked: {now} (check failed)"
-            ))
-            self.after(0, lambda: self._log(
-                "Server update check failed — will retry next interval."
-            ))
-            self.after(0, self._schedule_next_server_update_check)
+            self._invoke(lambda: self._server_update_label.setText("Check failed — see log"))
+            self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+            self._invoke(lambda: self._log("Server update check failed."))
+            self._invoke(self._schedule_next_server_update_check)
 
-    def _on_server_update_needed(self, timestamp: str):
-        self.server_update_status_label.configure(
-            text="Update available!", text_color="orange"
-        )
-        self.server_update_last_check_label.configure(
-            text=f"Last checked: {timestamp}"
-        )
+    def _on_server_update_needed(self, timestamp: str) -> None:
+        self._server_update_label.setText("Update available!")
+        self._server_update_label.setStyleSheet("color: #f0a030;")
+        self._server_update_last_label.setText(f"Last checked: {timestamp}")
         self._log("Server update available — starting 5-minute restart countdown.")
         self._start_restart_countdown(
             broadcast_messages=_SERVER_UPDATE_BROADCAST_AT,
@@ -874,52 +1439,37 @@ class App(ctk.CTk):
             post_fn=self._schedule_next_server_update_check,
         )
 
-    def _on_server_up_to_date(self, timestamp: str):
-        self.server_update_status_label.configure(
-            text="Server up to date  ✓", text_color="#22cc55"
-        )
-        self.server_update_last_check_label.configure(
-            text=f"Last checked: {timestamp}"
-        )
+    def _on_server_up_to_date(self, timestamp: str) -> None:
+        self._server_update_label.setText("Server up to date  ✓")
+        self._server_update_label.setStyleSheet("color: #3ddc84;")
+        self._server_update_last_label.setText(f"Last checked: {timestamp}")
         self._log("Server is up to date.")
         self._schedule_next_server_update_check()
 
-    def _schedule_next_server_update_check(self):
+    def _schedule_next_server_update_check(self) -> None:
         if self._server_update_check_job:
-            self.after_cancel(self._server_update_check_job)
+            self._server_update_check_job.stop()
         interval_ms = self.config.server_update_interval * 60 * 1000
-        self._server_update_check_job = self.after(
-            interval_ms, self._check_server_update_threaded
-        )
-        self._log(
-            f"Next server update check scheduled in "
-            f"{self.config.server_update_interval} minute(s)."
-        )
+        self._server_update_check_job = QTimer(self)
+        self._server_update_check_job.setSingleShot(True)
+        self._server_update_check_job.timeout.connect(self._check_server_update_threaded)
+        self._server_update_check_job.start(interval_ms)
+        self._log(f"Next server update check in {self.config.server_update_interval} minute(s).")
 
-    def _run_server_update_then_restart(self):
-        """
-        Stop server → wait for clean exit → run SteamCMD → restart.
-        Always restarts even if SteamCMD fails (keeps players from being locked out).
-        Called from the main thread; all blocking work done in a daemon thread.
-        """
+    def _run_server_update_then_restart(self) -> None:
         self._log("Stopping server for SteamCMD update…")
 
         def _do():
             import time as _time
-
-            # Stop the server
             try:
                 self.server.stop()
-                self.after(0, lambda: self._log(
-                    "Stop command sent — waiting for server to exit…"
-                ))
+                self._invoke(lambda: self._log("Stop command sent — waiting for server to exit…"))
             except Exception as exc:
-                self.after(0, lambda: self._log(f"Stop failed: {exc}"))
+                self._invoke(lambda: self._log(f"Stop failed: {exc}"))
                 return
 
-            # Poll until stopped or 30s timeout (Issue 6A)
             stopped = False
-            for _ in range(15):  # 15 × 2s = 30s
+            for _ in range(15):
                 _time.sleep(2)
                 try:
                     if not self.server.is_running():
@@ -929,193 +1479,156 @@ class App(ctk.CTk):
                     pass
 
             if not stopped:
-                self.after(0, lambda: self._log(
-                    "Server did not stop within 30s — aborting SteamCMD update. "
-                    "Stop the server manually and try again."
+                self._invoke(lambda: self._log(
+                    "Server did not stop within 30 s — aborting SteamCMD update."
                 ))
-                self.after(0, self._schedule_next_server_update_check)
+                self._invoke(self._schedule_next_server_update_check)
                 return
 
-            self.after(0, lambda: self._log(
-                "Server stopped. Running SteamCMD update…"
-            ))
-            self.after(0, lambda: self.server_update_status_label.configure(
-                text="Updating…", text_color="orange"
-            ))
+            self._invoke(lambda: self._log("Server stopped. Running SteamCMD update…"))
+            self._invoke(lambda: self._server_update_label.setText("Updating…"))
+            self._invoke(lambda: self._server_update_label.setStyleSheet("color: #f0a030;"))
 
-            # Run SteamCMD update
             success = self._server_update_checker.run_update()
 
             if success:
-                self.after(0, lambda: self._log(
-                    "SteamCMD update completed. Starting server…"
-                ))
-                self.after(0, lambda: self.server_update_status_label.configure(
-                    text="Updated  ✓", text_color="#22cc55"
-                ))
+                self._invoke(lambda: self._log("SteamCMD update completed. Starting server…"))
+                self._invoke(lambda: self._server_update_label.setText("Updated  ✓"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #3ddc84;"))
             else:
-                self.after(0, lambda: self._log(
-                    "Server update failed — restarting on current version. "
-                    "Check the activity log and SteamCMD path."
+                self._invoke(lambda: self._log(
+                    "Server update failed — restarting on current version."
                 ))
-                self.after(0, lambda: self.server_update_status_label.configure(
-                    text="Update failed — restarted", text_color="red"
-                ))
+                self._invoke(lambda: self._server_update_label.setText("Update failed — restarted"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
 
-            # Always bring the server back up (Issue 2A)
             try:
                 self.server.start()
-                self.after(0, lambda: self._log("Server start command sent."))
-                self.after(5000, self._check_server_status_threaded)
+                self._invoke(lambda: self._log("Server start command sent."))
+                QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self.after(0, lambda: self._log(f"Server start failed: {exc}"))
+                self._invoke(lambda: self._log(f"Server start failed: {exc}"))
 
         threading.Thread(target=_do, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # RCON Console (#4)
+    # RCON Console
     # ------------------------------------------------------------------
 
-    def _send_rcon_command(self):
-        command = self.rcon_input.get().strip()
+    def _send_rcon_command(self) -> None:
+        command = self.rcon_input.text().strip()
         if not command:
             return
-        self.rcon_input.delete(0, "end")
-        self._rcon_append(f"> {command}")
+        self.rcon_input.clear()
+        self.rcon_input.push_history(command)
+        self.rcon_output.append_line(f"> {command}", "info")
 
         def _do():
             try:
                 response = self.server.send_command(command)
-                self.after(0, lambda r=response: self._rcon_append(r))
+                self._invoke(lambda r=response: self.rcon_output.append_line(r))
             except Exception as exc:
-                self.after(0, lambda: self._rcon_append(f"Error: {exc}"))
+                self._invoke(lambda: self.rcon_output.append_line(f"Error: {exc}", "error"))
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _rcon_append(self, text: str):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.rcon_output.configure(state="normal")
-        self.rcon_output.insert("end", f"[{timestamp}] {text}\n")
-        self.rcon_output.see("end")
-        self.rcon_output.configure(state="disabled")
-
     # ------------------------------------------------------------------
-    # Live server log viewer (#5)
+    # Live server log viewer
     # ------------------------------------------------------------------
 
-    def _start_log_tail(self):
+    def _start_log_tail(self) -> None:
         if not self.config.zomboid_dir:
+            self._update_log_tab_state()
             return
         self._stop_log_tail()
-        self._log_tailer = LogTailer(self.config.zomboid_dir, self._enqueue_log_line)
+        self._log_tailer = LogTailer(self.config.zomboid_dir, self._on_log_line_from_thread)
         self._log_tailer.start()
 
-    def _stop_log_tail(self):
+    def _stop_log_tail(self) -> None:
         if self._log_tailer:
             self._log_tailer.stop()
             self._log_tailer = None
 
-    def _restart_log_tail(self):
+    def _restart_log_tail(self) -> None:
         self._stop_log_tail()
         self._start_log_tail()
 
-    def _enqueue_log_line(self, line: str):
-        """Called from the LogTailer background thread — never touches the UI directly."""
-        self._server_log_queue.put(line)
+    def _on_log_line_from_thread(self, line: str) -> None:
+        """Called from LogTailer's background thread — routes via LogBridge signal."""
+        self._log_bridge.line_received.emit(line)
 
-    def _drain_log_queue(self):
-        """
-        Runs on the main thread every 250 ms.
-        Batches all pending log lines into a single UI insert so we don't
-        flood the event loop with individual after() calls.
-        """
-        lines: list[str] = []
-        try:
-            while True:
-                lines.append(self._server_log_queue.get_nowait())
-        except queue.Empty:
-            pass
-
-        if lines:
-            text = "".join(lines)
-            self.server_log_box.configure(state="normal")
-            self.server_log_box.insert("end", text)
-            self.server_log_box.see("end")
-            self.server_log_box.configure(state="disabled")
-
-            if self._log_tailer and self._log_tailer.current_file:
-                fn = os.path.basename(self._log_tailer.current_file)
-                self._log_file_label.configure(
-                    text=f"Tailing: {fn}", text_color="#22cc55"
-                )
-
-        self.after(250, self._drain_log_queue)
-
-    # ------------------------------------------------------------------
-    # System tray
-    # ------------------------------------------------------------------
-
-    def _minimize_to_tray(self):
-        self.withdraw()
-        if self._tray_icon:
+    def _on_server_log_line(self, line: str) -> None:
+        """Received on the main thread via Qt queued connection."""
+        stripped = line.rstrip("\n")
+        if not stripped:
             return
+        level = _classify_line(stripped)
+        self.server_log.append_line(stripped, level)
 
-        image = self._make_tray_image()
-        menu = pystray.Menu(
-            pystray.MenuItem("Show", self._show_from_tray, default=True),
-            pystray.MenuItem("Quit", self._quit_from_tray),
-        )
-        self._tray_icon = pystray.Icon(
-            "PZ Manager", image, "PZ Server Manager", menu
-        )
-        threading.Thread(target=self._tray_icon.run, daemon=True).start()
-
-    def _show_from_tray(self, icon=None, item=None):
-        self.after(0, self.deiconify)
-        self.after(0, self.lift)
-        self.after(0, self.focus_force)
-
-    def _quit_from_tray(self, icon=None, item=None):
-        self._stop_log_tail()
-        if self._tray_icon:
-            self._tray_icon.stop()
-            self._tray_icon = None
-        self.after(0, self.destroy)
-
-    @staticmethod
-    def _make_tray_image() -> Image.Image:
-        img = Image.new("RGB", (64, 64), "#1a1a2e")
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([4, 4, 60, 60], outline="#4a9eff", width=3)
-        draw.rectangle([18, 18, 46, 46], fill="#4a9eff")
-        return img
+        if self._log_tailer and self._log_tailer.current_file:
+            fn = os.path.basename(self._log_tailer.current_file)
+            self._log_file_label.setText(f"Tailing: {fn}")
+            self._log_file_label.setStyleSheet("color: #3ddc84; font-size: 11px;")
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Activity log helper
     # ------------------------------------------------------------------
 
-    def _log(self, message: str):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        text = f"[{timestamp}] {message}\n"
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", text)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+    def _log(self, message: str) -> None:
+        level = _classify_line(message)
+        self.activity_log.append_line(message, level)
         logger.info(message)
 
-    def _clear_textbox(self, box: ctk.CTkTextbox):
-        box.configure(state="normal")
-        box.delete("1.0", "end")
-        box.configure(state="disabled")
+    # ------------------------------------------------------------------
+    # File pickers
+    # ------------------------------------------------------------------
 
-    def _pick_dir(self, entry: ctk.CTkEntry):
-        path = filedialog.askdirectory()
+    def _pick_dir(self, entry: QLineEdit) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
+            entry.setText(path)
 
-    def _pick_file(self, entry: ctk.CTkEntry):
-        path = filedialog.askopenfilename(filetypes=[("Executable", "*.exe")])
+    def _pick_file(self, entry: QLineEdit) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select File", "", "Executable (*.exe);;All files (*)"
+        )
         if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
+            entry.setText(path)
+
+    # ------------------------------------------------------------------
+    # Thread-safe UI dispatch
+    # ------------------------------------------------------------------
+
+    def _invoke(self, fn) -> None:
+        """
+        Schedule fn() to run on the main thread via a zero-delay QTimer.
+        Safe to call from any thread.
+        """
+        QTimer.singleShot(0, fn)
+
+
+# ---------------------------------------------------------------------------
+# Programmatic tray/window icon — no external file needed
+# ---------------------------------------------------------------------------
+
+def _make_icon() -> QIcon:
+    """
+    Draw a minimal server-manager icon: dark background with a green square
+    (representing a running process / terminal block).
+    """
+    px = QPixmap(QSize(32, 32))
+    px.fill(QColor("#1a1a2e"))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    # Outer ring
+    p.setBrush(QColor("#4d9de0"))
+    p.drawRoundedRect(2, 2, 28, 28, 4, 4)
+    # Inner square (darker)
+    p.setBrush(QColor("#1a1a2e"))
+    p.drawRoundedRect(6, 6, 20, 20, 3, 3)
+    # Green dot
+    p.setBrush(QColor("#3ddc84"))
+    p.drawEllipse(11, 11, 10, 10)
+    p.end()
+    return QIcon(px)

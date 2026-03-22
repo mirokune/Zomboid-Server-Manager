@@ -304,7 +304,8 @@ class TestAppConfigPersistence(unittest.TestCase):
 
     def test_new_fields_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_file = os.path.join(tmpdir, "pz_server_config.ini")
+            from pathlib import Path
+            config_file = Path(tmpdir) / "pz_server_config.ini"
 
             cfg = AppConfig()
             cfg.steamcmd_path = r"C:\steamcmd\steamcmd.exe"
@@ -312,18 +313,17 @@ class TestAppConfigPersistence(unittest.TestCase):
             cfg.steamcmd_timeout = 300
             cfg.last_server_update_check = "2026-03-20 15:00:00"
 
-            # Patch CONFIG_FILE path
             import backend
-            original = backend.CONFIG_FILE
-            try:
-                backend.CONFIG_FILE = config_file
+            _no_legacy = Path(tmpdir) / "nonexistent_legacy.ini"
+            with patch.object(backend, "_config_path", return_value=config_file), \
+                 patch.object(backend, "_legacy_config_path", return_value=_no_legacy), \
+                 patch("backend.keyring.set_password"), \
+                 patch("backend.keyring.get_password", return_value=""), \
+                 patch("backend.keyring.delete_password"):
                 cfg.save()
 
                 loaded = AppConfig()
-                backend.CONFIG_FILE = config_file
                 loaded.load()
-            finally:
-                backend.CONFIG_FILE = original
 
             self.assertEqual(loaded.steamcmd_path, r"C:\steamcmd\steamcmd.exe")
             self.assertEqual(loaded.server_update_interval, 120)
@@ -339,7 +339,8 @@ class TestAppConfigPersistence(unittest.TestCase):
 
     def test_invalid_integer_fields_fall_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_file = os.path.join(tmpdir, "pz_server_config.ini")
+            from pathlib import Path
+            config_file = Path(tmpdir) / "pz_server_config.ini"
             # Write a config with bad integer values
             parser = configparser.ConfigParser()
             parser["SETTINGS"] = {
@@ -350,13 +351,12 @@ class TestAppConfigPersistence(unittest.TestCase):
                 parser.write(f)
 
             import backend
-            original = backend.CONFIG_FILE
-            try:
-                backend.CONFIG_FILE = config_file
+            _no_legacy = Path(tmpdir) / "nonexistent_legacy.ini"
+            with patch.object(backend, "_config_path", return_value=config_file), \
+                 patch.object(backend, "_legacy_config_path", return_value=_no_legacy), \
+                 patch("backend.keyring.get_password", return_value=""):
                 cfg = AppConfig()
                 cfg.load()
-            finally:
-                backend.CONFIG_FILE = original
 
             self.assertEqual(cfg.server_update_interval, 60)
             self.assertEqual(cfg.steamcmd_timeout, 600)

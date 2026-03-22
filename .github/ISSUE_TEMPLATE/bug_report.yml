@@ -1,0 +1,54 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the sections below.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Check the title bar — it shows the version (e.g. "PZ Server Manager v0.1.0")
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: How did you install it?
+      options:
+        - Installer (PZServerManager-Setup.exe)
+        - Portable EXE (PZServerManager.exe)
+        - From source (python main.py)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you do, what went wrong?
+      placeholder: I clicked Start Server and the app crashed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: The server should have started.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log output (optional but helpful)
+      description: |
+        Paste the contents of `pz_manager.log` (in the same folder as the EXE).
+        Also paste any error messages from the Activity Log in the app.
+      render: text
