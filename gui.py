@@ -412,8 +412,9 @@ class App(QMainWindow):
 
         # Deferred startup — let window render first
         QTimer.singleShot(400, self._check_server_status_threaded)
-        QTimer.singleShot(600, self._resume_auto_check)
-        QTimer.singleShot(700, self._resume_server_update_check)
+        if self._config_is_ready():
+            QTimer.singleShot(600, self._resume_auto_check)
+            QTimer.singleShot(700, self._resume_server_update_check)
         QTimer.singleShot(800, self._start_log_tail)
         self._start_status_poll()
         self._start_sched_poll()
@@ -1012,6 +1013,13 @@ class App(QMainWindow):
         self._update_status_bar()
         self._update_log_tab_state()
 
+        # If config just became valid for the first time, start the check pipelines.
+        if self._config_is_ready():
+            if self._auto_check_job is None:
+                self._resume_auto_check()
+            if self._server_update_check_job is None:
+                self._resume_server_update_check()
+
         if self.config.zomboid_dir != old_zomboid_dir:
             self._restart_log_tail()
 
@@ -1202,6 +1210,15 @@ class App(QMainWindow):
             timer.start(10_000)
 
         return timer
+
+    # ------------------------------------------------------------------
+    # Config validity guard
+    # ------------------------------------------------------------------
+
+    def _config_is_ready(self) -> bool:
+        """Return True only when the minimum required fields are filled in."""
+        c = self.config
+        return bool(c.server_dir and c.rcon_path and c.server_ip and c.password)
 
     # ------------------------------------------------------------------
     # Mod update pipeline

@@ -6,6 +6,7 @@ Business logic: configuration, server control, log parsing, and log tailing.
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,6 +14,13 @@ import logging
 import configparser
 from datetime import datetime
 from glob import glob
+
+# On Windows, suppress the console window when spawning child processes.
+_SUBPROCESS_FLAGS: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW}
+    if sys.platform == "win32"
+    else {}
+)
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -265,7 +273,7 @@ class ServerManager:
                 f.write(f"address: {cfg.server_ip}\npassword: {cfg.password}\n")
             args = [cfg.rcon_path, "--config", tmp, command]
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=15
+                args, capture_output=True, text=True, timeout=15, **_SUBPROCESS_FLAGS
             )
             return result.stdout if capture else None
         except subprocess.TimeoutExpired:
@@ -553,6 +561,7 @@ class ServerUpdateChecker:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **_SUBPROCESS_FLAGS,
             )
             output = result.stdout + result.stderr
             # Only match buildid lines that appear after the app ID header in the
@@ -622,6 +631,7 @@ class ServerUpdateChecker:
                 capture_output=True,
                 text=True,
                 timeout=self.config.steamcmd_timeout,
+                **_SUBPROCESS_FLAGS,
             )
             if result.returncode == 0:
                 logger.info("SteamCMD update completed successfully.")

@@ -14,7 +14,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `_rcon()`: removed `shell=True` — special characters in the server IP or password could break execution
 - SteamCMD `+app_update` command was passed as a single string instead of three separate tokens; `validate` flag was never applied
 - 11 lambda/exc closures in `gui.py` caused `NameError` when exceptions were reported on the Qt main thread after the except block exited
-- Startup guards: mod check and server update check no longer fire before server status is known or config is set
+- Startup guards: mod check and server update check no longer fire before server status is known or config is set; both pipelines now start immediately after the first valid config save
+- SteamCMD subprocess no longer opens a visible console window on startup (added `CREATE_NO_WINDOW` flag on Windows)
 - PowerShell injection: single-quotes in `server_name` are now escaped before being interpolated into the `is_running()` WMI filter
 - Double-quotes in broadcast messages are now escaped, preventing malformed RCON `servermsg` commands
 - Config save is now atomic (write to `.tmp` + `os.replace`) and serialized with a lock — prevents partial writes or race conditions when mod and server update threads save simultaneously
