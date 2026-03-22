@@ -78,5 +78,5 @@ jobs:
             3. Click **Save Configuration**
 
             ### Notes
-            - Config is saved next to the EXE. The installer defaults to your user folder (no admin needed).
-              If you chose a system-wide install path and config won't save, use the portable EXE instead.
+            - Config is saved in `%APPDATA%\PZServerManager\`. The RCON password is stored in Windows Credential Manager and never written to disk.
+              The installer defaults to your user folder (no admin needed).

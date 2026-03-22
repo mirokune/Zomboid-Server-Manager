@@ -110,6 +110,9 @@ class AppConfig:
                 logger.info("Migrated plaintext password to Windows Credential Manager.")
             except Exception as exc:
                 logger.warning("Could not migrate password to Credential Manager: %s", exc)
+            # Set password before save() so it doesn't call delete_password() on the
+            # credential we just migrated.
+            self.password = legacy_pw
             # Rewrite the INI without the password field.
             self.save()
 
@@ -243,7 +246,7 @@ class ServerManager:
         args = [cfg.rcon_path, "-a", cfg.server_ip, "-p", cfg.password, command]
         try:
             result = subprocess.run(
-                args, shell=True, capture_output=True, text=True, timeout=15
+                args, capture_output=True, text=True, timeout=15
             )
             return result.stdout if capture else None
         except subprocess.TimeoutExpired:
@@ -581,7 +584,7 @@ class ServerUpdateChecker:
                     self.config.steamcmd_path,
                     "+login", "anonymous",
                     "+force_install_dir", server_dir_norm,
-                    f"+app_update {self.APP_ID} validate",
+                    "+app_update", self.APP_ID, "validate",
                     "+quit",
                 ],
                 capture_output=True,

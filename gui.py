@@ -1018,7 +1018,7 @@ class App(QMainWindow):
         try:
             running = self.server.is_running()
         except Exception as exc:
-            self._invoke(lambda: self._set_status_error(str(exc)))
+            self._invoke(lambda e=exc: self._set_status_error(str(e)))
             return False
         self._invoke(lambda r=running: self._set_status(r))
         return running
@@ -1074,7 +1074,7 @@ class App(QMainWindow):
                 self._invoke(lambda: self._status_text.setText("Starting…"))
                 QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self._invoke(lambda: self._log(f"Start failed: {exc}"))
+                self._invoke(lambda e=exc: self._log(f"Start failed: {e}"))
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
@@ -1090,7 +1090,7 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("Stop command sent."))
                 QTimer.singleShot(6000, self._check_server_status_threaded)
             except Exception as exc:
-                self._invoke(lambda: self._log(f"Stop failed: {exc}"))
+                self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
@@ -1109,7 +1109,7 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("Server restarted."))
                 QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self._invoke(lambda: self._log(f"Restart failed: {exc}"))
+                self._invoke(lambda e=exc: self._log(f"Restart failed: {e}"))
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
@@ -1227,8 +1227,8 @@ class App(QMainWindow):
         try:
             self.server.check_mods_need_update()
         except Exception as exc:
-            self._invoke(lambda: self._log(f"RCON error: {exc}"))
-            self._invoke(lambda: self._set_mod_status(f"RCON error: {exc}", "error"))
+            self._invoke(lambda e=exc: self._log(f"RCON error: {e}"))
+            self._invoke(lambda e=exc: self._set_mod_status(f"RCON error: {e}", "error"))
             return
 
         zomboid_dir = self.config.zomboid_dir
@@ -1359,7 +1359,7 @@ class App(QMainWindow):
         try:
             self.server.broadcast(message)
         except Exception as exc:
-            self._invoke(lambda: self._log(f"Broadcast failed: {exc}"))
+            self._invoke(lambda e=exc: self._log(f"Broadcast failed: {e}"))
 
     def _maybe_early_restart(self) -> None:
         try:
@@ -1370,7 +1370,7 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("No players online — triggering early restart."))
                 self._countdown_remaining = 0
         except Exception as exc:
-            self._invoke(lambda: self._log(f"Player count check failed: {exc}"))
+            self._invoke(lambda e=exc: self._log(f"Player count check failed: {e}"))
 
     def _schedule_next_check(self) -> None:
         if self._auto_check_job:
@@ -1465,7 +1465,7 @@ class App(QMainWindow):
                 self.server.stop()
                 self._invoke(lambda: self._log("Stop command sent — waiting for server to exit…"))
             except Exception as exc:
-                self._invoke(lambda: self._log(f"Stop failed: {exc}"))
+                self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
                 return
 
             stopped = False
@@ -1507,7 +1507,7 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("Server start command sent."))
                 QTimer.singleShot(5000, self._check_server_status_threaded)
             except Exception as exc:
-                self._invoke(lambda: self._log(f"Server start failed: {exc}"))
+                self._invoke(lambda e=exc: self._log(f"Server start failed: {e}"))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1528,7 +1528,7 @@ class App(QMainWindow):
                 response = self.server.send_command(command)
                 self._invoke(lambda r=response: self.rcon_output.append_line(r))
             except Exception as exc:
-                self._invoke(lambda: self.rcon_output.append_line(f"Error: {exc}", "error"))
+                self._invoke(lambda e=exc: self.rcon_output.append_line(f"Error: {e}", "error"))
 
         threading.Thread(target=_do, daemon=True).start()
 
