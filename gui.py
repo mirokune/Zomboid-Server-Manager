@@ -1082,7 +1082,7 @@ class App(QMainWindow):
                 self.server.start()
                 self._invoke(lambda: self._log("Server is launching…"))
                 self._invoke(lambda: self._status_text.setText("Starting…"))
-                QTimer.singleShot(5000, self._check_server_status_threaded)
+                self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
                 self._invoke(lambda e=exc: self._log(f"Start failed: {e}"))
             finally:
@@ -1098,7 +1098,7 @@ class App(QMainWindow):
             try:
                 self.server.stop()
                 self._invoke(lambda: self._log("Stop command sent."))
-                QTimer.singleShot(6000, self._check_server_status_threaded)
+                self._invoke(lambda: QTimer.singleShot(6000, self._check_server_status_threaded))
             except Exception as exc:
                 self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
             finally:
@@ -1117,7 +1117,7 @@ class App(QMainWindow):
                 _time.sleep(6)
                 self.server.start()
                 self._invoke(lambda: self._log("Server restarted."))
-                QTimer.singleShot(5000, self._check_server_status_threaded)
+                self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
                 self._invoke(lambda e=exc: self._log(f"Restart failed: {e}"))
             finally:
@@ -1164,7 +1164,10 @@ class App(QMainWindow):
             ):
                 self._last_sched_restart_date = today
                 self._log(f"Scheduled daily restart at {sched} triggered.")
-                self._restart_server()
+                if self._countdown_active:
+                    self._log("Scheduled restart deferred — countdown already active.")
+                else:
+                    self._restart_server()
         except ValueError:
             pass
 
@@ -1320,6 +1323,9 @@ class App(QMainWindow):
         action=None,
         post_fn=None,
     ) -> None:
+        if self._countdown_active:
+            self._log("Restart countdown already running — skipping duplicate start.")
+            return
         self._countdown_remaining = seconds
         self._countdown_active = True
         self._countdown_broadcast_messages = broadcast_messages or _BROADCAST_AT
@@ -1372,13 +1378,15 @@ class App(QMainWindow):
             self._invoke(lambda e=exc: self._log(f"Broadcast failed: {e}"))
 
     def _maybe_early_restart(self) -> None:
+        if not self._countdown_active:
+            return
         try:
             count = self.server.get_player_count()
             self._invoke(lambda: self._log(f"Players currently online: {count}"))
             self._invoke(lambda: self._cd_players_count.setText(str(count)))
             if count == 0:
                 self._invoke(lambda: self._log("No players online — triggering early restart."))
-                self._countdown_remaining = 0
+                self._invoke(lambda: setattr(self, "_countdown_remaining", 0))
         except Exception as exc:
             self._invoke(lambda e=exc: self._log(f"Player count check failed: {e}"))
 

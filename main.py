@@ -4,13 +4,23 @@ Entry point. Prevents duplicate instances via a local socket lock,
 then launches the PyQt6 UI.
 """
 
+import os
 import socket
 import sys
 import logging
+from pathlib import Path
+
+
+def _log_path() -> str:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    d = Path(appdata) / "PZServerManager"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d / "pz_manager.log")
+
 
 # Configure logging before any other imports
 logging.basicConfig(
-    filename="pz_manager.log",
+    filename=_log_path(),
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )

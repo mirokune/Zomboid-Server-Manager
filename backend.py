@@ -6,6 +6,7 @@ Business logic: configuration, server control, log parsing, and log tailing.
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import logging
@@ -156,8 +157,11 @@ class AppConfig:
             "last_server_update_check": self.last_server_update_check,
         }
         dest = _config_path()
-        with open(dest, "w") as f:
+        dest_dir = os.path.dirname(dest)
+        with tempfile.NamedTemporaryFile("w", dir=dest_dir, delete=False, suffix=".tmp") as f:
+            tmp_path = f.name
             config.write(f)
+        os.replace(tmp_path, dest)
         logger.info("Configuration saved to %s", dest)
 
 
@@ -208,7 +212,8 @@ class ServerManager:
 
     def broadcast(self, message: str):
         """Send an in-game server-wide message via RCON servermsg."""
-        self._rcon(f'servermsg "{message}"')
+        safe = message.replace('"', '\\"')
+        self._rcon(f'servermsg "{safe}"')
         logger.info("Broadcast sent: %s", message)
 
     def check_mods_need_update(self):
@@ -375,7 +380,8 @@ class LogParser:
             if not os.path.exists(path):
                 continue
             try:
-                content = open(path, "r", encoding="utf-8", errors="replace").read()
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
                 mods_m = re.search(r"^Mods=(.+)$", content, re.MULTILINE)
                 wids_m = re.search(r"^WorkshopItems=(.+)$", content, re.MULTILINE)
                 if mods_m and wids_m:
