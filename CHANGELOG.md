@@ -10,10 +10,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Migration bug: RCON password was erased from Windows Credential Manager on first run after upgrading from a plaintext-config build
-- `_rcon()`: removed `shell=True` — RCON password was visible in the process list and special characters could break execution
+- `_rcon()`: RCON password is now passed via a temporary YAML config file instead of as a command-line argument, so it never appears in the process list
+- `_rcon()`: removed `shell=True` — special characters in the server IP or password could break execution
 - SteamCMD `+app_update` command was passed as a single string instead of three separate tokens; `validate` flag was never applied
 - 11 lambda/exc closures in `gui.py` caused `NameError` when exceptions were reported on the Qt main thread after the except block exited
 - Startup guards: mod check and server update check no longer fire before server status is known or config is set
+- PowerShell injection: single-quotes in `server_name` are now escaped before being interpolated into the `is_running()` WMI filter
+- Double-quotes in broadcast messages are now escaped, preventing malformed RCON `servermsg` commands
+- Config save is now atomic (write to `.tmp` + `os.replace`) and serialized with a lock — prevents partial writes or race conditions when mod and server update threads save simultaneously
+- `_start_restart_countdown()` now guards against double-start; a second call while a countdown is running is ignored
+- `_maybe_early_restart()` checks `_countdown_active` before proceeding and writes `_countdown_remaining` via `_invoke` (cross-thread write fix)
+- `_check_scheduled_restart()` defers the restart if a countdown is already active
+- Three `QTimer.singleShot` calls inside daemon threads are now wrapped in `_invoke()` so they execute on the Qt main thread
+- Log file is now written to `%APPDATA%\PZServerManager\pz_manager.log` instead of the current working directory
 
 ## v0.1.0 — 2026-03-21
 

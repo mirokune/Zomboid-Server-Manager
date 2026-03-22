@@ -362,5 +362,89 @@ class TestAppConfigPersistence(unittest.TestCase):
             self.assertEqual(cfg.steamcmd_timeout, 600)
 
 
+# ---------------------------------------------------------------------------
+# ServerManager — new security fixes
+# ---------------------------------------------------------------------------
+
+class TestServerManagerSecurity(unittest.TestCase):
+
+    def _manager(self, **kwargs) -> "ServerManager":
+        from backend import ServerManager
+        cfg = AppConfig()
+        cfg.rcon_path = kwargs.get("rcon_path", r"C:\rcon.exe")
+        cfg.server_ip = kwargs.get("server_ip", "127.0.0.1:27015")
+        cfg.password = kwargs.get("password", "secret")
+        cfg.server_name = kwargs.get("server_name", "myserver")
+        return ServerManager(cfg)
+
+    def test_broadcast_escapes_double_quotes(self):
+        """broadcast() must escape embedded double-quotes in the message."""
+        from backend import ServerManager
+        mgr = self._manager()
+        captured = []
+        with patch.object(ServerManager, "_rcon", side_effect=lambda cmd, **kw: captured.append(cmd)):
+            mgr.broadcast('Hello "world"')
+        self.assertEqual(captured[0], r'servermsg "Hello \"world\""')
+
+    def test_rcon_uses_temp_config_file(self):
+        """_rcon() must not pass the password as a command-line argument."""
+        from backend import ServerManager
+        mgr = self._manager()
+        called_args = []
+        fake_result = MagicMock()
+        fake_result.stdout = ""
+        with patch("subprocess.run", side_effect=lambda args, **kw: called_args.append(args) or fake_result):
+            mgr._rcon("players")
+        # Password must NOT appear anywhere in the subprocess args list
+        self.assertTrue(len(called_args) > 0)
+        flat_args = " ".join(str(a) for a in called_args[0])
+        self.assertNotIn("secret", flat_args)
+        # The --config flag must be present
+        self.assertIn("--config", called_args[0])
+
+    def test_is_running_escapes_single_quotes_in_server_name(self):
+        """is_running() must escape single-quotes in server_name for PS -like filter."""
+        from backend import ServerManager
+        mgr = self._manager(server_name="it's my server")
+        captured = []
+        fake_result = MagicMock()
+        fake_result.stdout = ""
+        with patch("subprocess.run", side_effect=lambda cmd, **kw: captured.append(cmd) or fake_result):
+            mgr.is_running()
+        # The PowerShell command string should contain the escaped form ('' not ')
+        self.assertIn("it''s my server", captured[0])
+
+
+# ---------------------------------------------------------------------------
+# AppConfig.save() — atomic write + lock
+# ---------------------------------------------------------------------------
+
+class TestAppConfigAtomicSave(unittest.TestCase):
+
+    def test_save_is_atomic_no_partial_write(self):
+        """save() writes to a temp file then os.replace — never a partial INI."""
+        import backend
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / "pz_server_config.ini"
+            no_legacy = Path(tmpdir) / "nope.ini"
+
+            cfg = AppConfig()
+            cfg.server_dir = r"C:\pz"
+            cfg.server_ip = "127.0.0.1:27015"
+
+            with patch.object(backend, "_config_path", return_value=config_file), \
+                 patch.object(backend, "_legacy_config_path", return_value=no_legacy), \
+                 patch("backend.keyring.set_password"), \
+                 patch("backend.keyring.delete_password"):
+                cfg.save()
+
+            self.assertTrue(config_file.exists())
+            # No .tmp files left over
+            tmp_files = list(Path(tmpdir).glob("*.tmp"))
+            self.assertEqual(len(tmp_files), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
