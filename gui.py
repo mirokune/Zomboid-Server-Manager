@@ -788,6 +788,9 @@ class App(QMainWindow):
             ("Server IP:",   "server_ip",   None),
             ("Password:",    "password",    "password"),
         ])
+        self._settings_entries["server_ip"].setPlaceholderText("127.0.0.1:27015")
+        self._settings_entries["server_name"].setPlaceholderText("e.g. servertest")
+        self._settings_entries["password"].setPlaceholderText("RCON password from servertest.ini")
 
         # Schedule & Timing group (manual, not via _add_group — has combo boxes)
         sched_box = QGroupBox("Schedule & Timing")
@@ -1235,7 +1238,17 @@ class App(QMainWindow):
     def _check_mods_threaded(self) -> None:
         cfg = self.config
         if not (cfg.rcon_path and cfg.server_ip and cfg.password):
-            self._log("RCON not configured — open Settings to get started.")
+            missing = [
+                name for name, val in [
+                    ("RCON Executable", cfg.rcon_path),
+                    ("Server IP",       cfg.server_ip),
+                    ("Password",        cfg.password),
+                ] if not val
+            ]
+            self._log(
+                f"RCON not fully configured — missing: {', '.join(missing)}. "
+                "Fill in the Connection group in Settings and click Save."
+            )
             self._schedule_next_check()
             return
         if self._server_running is None:
