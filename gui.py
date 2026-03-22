@@ -536,9 +536,19 @@ class App(QMainWindow):
         )
         cd_right.addWidget(self._cd_players_label)
         cd_right.addWidget(self._cd_players_count)
+        self._cd_cancel_btn = QPushButton("Cancel Restart")
+        self._cd_cancel_btn.setFixedHeight(28)
+        self._cd_cancel_btn.setStyleSheet(
+            "QPushButton { background: #444; color: #ccc; border: 1px solid #666;"
+            " border-radius: 4px; padding: 0 10px; font-size: 11px; }"
+            "QPushButton:hover { background: #555; color: #fff; }"
+        )
+        self._cd_cancel_btn.clicked.connect(self._cancel_countdown)
         cd_layout.addLayout(cd_left)
         cd_layout.addStretch()
         cd_layout.addLayout(cd_right)
+        cd_layout.addSpacing(10)
+        cd_layout.addWidget(self._cd_cancel_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         left_layout.addWidget(self._countdown_frame)
 
         # Mod updates card
@@ -1371,6 +1381,19 @@ class App(QMainWindow):
                 self._countdown_remaining = 0
         except Exception as exc:
             self._invoke(lambda e=exc: self._log(f"Player count check failed: {e}"))
+
+    def _cancel_countdown(self) -> None:
+        """Cancel the active restart countdown without restarting the server."""
+        self._countdown_active = False
+        self._countdown_frame.setVisible(False)
+        self._countdown_spacer.setVisible(True)
+        self._log("Restart countdown cancelled by admin.")
+        threading.Thread(
+            target=lambda: self._broadcast_safe("Server restart has been cancelled."),
+            daemon=True,
+        ).start()
+        if self._countdown_post_fn:
+            self._countdown_post_fn()
 
     def _schedule_next_check(self) -> None:
         if self._auto_check_job:
