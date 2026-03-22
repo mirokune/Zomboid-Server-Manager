@@ -2,6 +2,9 @@ name: Tests
 
 on: [push, pull_request]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   test:
     runs-on: ubuntu-latest   # backend tests have no Windows-specific logic
@@ -15,9 +18,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install keyring pytest
 
       - name: Run tests
         run: python -m pytest test_backend.py -v
-        env:
-          QT_QPA_PLATFORM: offscreen   # required for headless Qt (test_gui.py when added)

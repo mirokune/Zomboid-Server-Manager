@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*.*.*'
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -15,11 +18,9 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install keyring pytest
       - name: Run tests
         run: python -m pytest test_backend.py -v
-        env:
-          QT_QPA_PLATFORM: offscreen
 
   build:
     needs: test           # release only publishes if tests pass
