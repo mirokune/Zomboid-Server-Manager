@@ -136,7 +136,7 @@ A: Yes. The portable EXE extracts itself to a temp folder on first launch (this 
 A: Yes — SteamCMD is only needed for the server update pipeline. If you don't set a SteamCMD path, that pipeline is skipped; everything else works normally.
 
 **Q: The countdown started but I need to cancel it — what do I do?**
-A: Restart the app. There is no in-app cancel button yet (see [TODOS.md](TODOS.md)).
+A: Click the **Cancel Restart** button in the countdown banner. This stops the countdown, hides the banner, and broadcasts "Server restart has been cancelled." to all players in-game. The next automatic check is scheduled normally.
 
 ---
 
