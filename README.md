@@ -31,14 +31,11 @@ A Windows desktop app for managing a **Project Zomboid dedicated server**. Monit
 2. Download **PZServerManager-Setup.exe**
 3. Run it — it installs the app and creates a Start Menu shortcut
 
-> **Note:** If you install to `C:\Program Files\` and the app can't save its config,
-> right-click the shortcut → *Run as Administrator* once, or use the portable EXE instead.
-
 ### Option 2: Portable EXE (no installation)
 
 1. Download **PZServerManager.exe** from the [Releases page](https://github.com/mirokune/Zomboid-Server-Manager/releases)
 2. Put it anywhere (Desktop, a dedicated server folder, etc.)
-3. Double-click to run — your config is saved in the same folder
+3. Double-click to run — config is saved to `%APPDATA%\PZServerManager\`, not next to the EXE
 
 ### Option 3: Run from source (developers)
 

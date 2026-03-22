@@ -1392,8 +1392,8 @@ class App(QMainWindow):
             target=lambda: self._broadcast_safe("Server restart has been cancelled."),
             daemon=True,
         ).start()
-        if self._countdown_post_fn:
-            self._countdown_post_fn()
+        post_fn = self._countdown_post_fn or self._schedule_next_check
+        post_fn()
 
     def _schedule_next_check(self) -> None:
         if self._auto_check_job:

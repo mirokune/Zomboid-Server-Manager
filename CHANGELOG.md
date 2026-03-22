@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+- **Cancel Restart** button in the countdown banner — admins can abort a pending restart and broadcast "Server restart has been cancelled." to players in-game
+
+### Fixed
+- Migration bug: RCON password was erased from Windows Credential Manager on first run after upgrading from a plaintext-config build
+- `_rcon()`: removed `shell=True` — RCON password was visible in the process list and special characters could break execution
+- SteamCMD `+app_update` command was passed as a single string instead of three separate tokens; `validate` flag was never applied
+- 11 lambda/exc closures in `gui.py` caused `NameError` when exceptions were reported on the Qt main thread after the except block exited
+- Startup guards: mod check and server update check no longer fire before server status is known or config is set
+
 ## v0.1.0 — 2026-03-21
 
 ### Added
