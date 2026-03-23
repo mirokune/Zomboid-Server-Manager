@@ -391,6 +391,36 @@ class TestRunUpdate(unittest.TestCase):
 
         self.assertEqual(captured_kwargs.get("timeout"), 120)
 
+    def test_non_public_branch_adds_beta_flag(self):
+        cfg = _make_config()
+        cfg.steam_branch = "unstable"
+        checker = ServerUpdateChecker(cfg)
+        captured_args = []
+
+        def fake_run(args, **kwargs):
+            captured_args.extend(args)
+            return self._fake_run(0)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            checker.run_update()
+
+        self.assertIn("-beta", captured_args)
+        beta_idx = captured_args.index("-beta")
+        self.assertEqual(captured_args[beta_idx + 1], "unstable")
+
+    def test_public_branch_omits_beta_flag(self):
+        checker = self._checker()  # steam_branch defaults to "public"
+        captured_args = []
+
+        def fake_run(args, **kwargs):
+            captured_args.extend(args)
+            return self._fake_run(0)
+
+        with patch("subprocess.run", side_effect=fake_run):
+            checker.run_update()
+
+        self.assertNotIn("-beta", captured_args)
+
 
 # ---------------------------------------------------------------------------
 # AppConfig persistence — new fields

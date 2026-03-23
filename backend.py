@@ -566,10 +566,16 @@ class ServerUpdateChecker:
                 **_SUBPROCESS_FLAGS,
             )
             output = result.stdout + result.stderr
+            # Guard: only match BuildID lines after the AppID header so we
+            # never pick up SteamCMD's own installer BuildID in the preamble.
+            in_app_section = False
             for line in output.splitlines():
-                m = re.search(r'BuildID\s*:\s*(\d+)', line, re.IGNORECASE)
-                if m:
-                    return m.group(1)
+                if f"AppID {self.APP_ID}" in line:
+                    in_app_section = True
+                if in_app_section:
+                    m = re.search(r'BuildID\s*:\s*(\d+)', line, re.IGNORECASE)
+                    if m:
+                        return m.group(1)
             logger.debug("SteamCMD app_status output (no BuildID found):\n%s", output[:2000])
         except subprocess.TimeoutExpired:
             logger.warning("SteamCMD app_status timed out after 30s.")
@@ -606,7 +612,12 @@ class ServerUpdateChecker:
         WANT_DEPOTS, WANT_BRANCHES, WANT_BRANCH, WANT_BUILDID = range(4)
         state = WANT_DEPOTS
         depth = 0
-        section_depth = 0
+        # Per-state entry depths so closing-brace transitions stay accurate
+        # even after resets (e.g. WANT_BUILDID → WANT_BRANCHES reuse the
+        # correct depth for the WANT_BRANCHES level, not the WANT_BUILDID level).
+        depth_branches = 0  # depth at which we entered WANT_BRANCHES
+        depth_branch = 0    # depth at which we entered WANT_BRANCH
+        depth_buildid = 0   # depth at which we entered WANT_BUILDID
 
         for line in text.splitlines():
             stripped = line.strip()
@@ -615,26 +626,27 @@ class ServerUpdateChecker:
                 continue
             if stripped == "}":
                 depth -= 1
-                if state == WANT_BRANCHES and depth < section_depth:
+                if state == WANT_BRANCHES and depth < depth_branches:
                     state = WANT_DEPOTS
-                elif state == WANT_BRANCH and depth < section_depth:
+                elif state == WANT_BRANCH and depth < depth_branch:
                     state = WANT_BRANCHES
-                elif state == WANT_BUILDID and depth < section_depth:
-                    state = WANT_BRANCHES
+                elif state == WANT_BUILDID and depth < depth_buildid:
+                    # Branch block closed without finding buildid — try next sibling.
+                    state = WANT_BRANCH
                 continue
 
             if state == WANT_DEPOTS:
                 if re.search(r'^\s*"depots"\s*$', line):
                     state = WANT_BRANCHES
-                    section_depth = depth + 1
+                    depth_branches = depth + 1
             elif state == WANT_BRANCHES:
                 if re.search(r'^\s*"branches"\s*$', line):
                     state = WANT_BRANCH
-                    section_depth = depth + 1
+                    depth_branch = depth + 1
             elif state == WANT_BRANCH:
                 if re.search(rf'^\s*"{re.escape(branch)}"\s*$', line):
                     state = WANT_BUILDID
-                    section_depth = depth + 1
+                    depth_buildid = depth + 1
             elif state == WANT_BUILDID:
                 m = re.search(r'^\s*"buildid"\s+"(\d+)"', line)
                 if m:
@@ -721,15 +733,19 @@ class ServerUpdateChecker:
         Returns True on exit code 0, False on failure or timeout.
         """
         server_dir_norm = os.path.normpath(self.config.server_dir)
+        branch = getattr(self.config, "steam_branch", "public") or "public"
+        cmd = [
+            self.config.steamcmd_path,
+            "+login", "anonymous",
+            "+force_install_dir", server_dir_norm,
+            "+app_update", self.APP_ID,
+        ]
+        if branch != "public":
+            cmd += ["-beta", branch]
+        cmd += ["validate", "+quit"]
         try:
             result = subprocess.run(
-                [
-                    self.config.steamcmd_path,
-                    "+login", "anonymous",
-                    "+force_install_dir", server_dir_norm,
-                    "+app_update", self.APP_ID, "validate",
-                    "+quit",
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=self.config.steamcmd_timeout,
