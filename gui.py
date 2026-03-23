@@ -417,8 +417,8 @@ class App(QMainWindow):
             QTimer.singleShot(600, self._resume_auto_check)
             QTimer.singleShot(700, self._resume_server_update_check)
         QTimer.singleShot(800, self._start_log_tail)
-        self._start_status_poll()
-        self._start_sched_poll()
+        # Polls are started by _set_status() once the first running check
+        # completes — only when config is valid and server is running.
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -1023,6 +1023,11 @@ class App(QMainWindow):
                 self._resume_auto_check()
             if self._server_update_check_job is None:
                 self._resume_server_update_check()
+            if self._server_running:
+                if self._poll_status_job is None:
+                    self._start_status_poll()
+                if self._sched_job is None:
+                    self._start_sched_poll()
 
         if self.config.zomboid_dir != old_zomboid_dir:
             self._restart_log_tail()
@@ -1061,6 +1066,13 @@ class App(QMainWindow):
 
     def _set_status(self, running: bool) -> None:
         self._server_running = running
+        # Start recurring polls on the first known-running result when config is ready.
+        # Guards prevent double-start on subsequent 60 s ticks.
+        if running and self._config_is_ready():
+            if self._poll_status_job is None:
+                self._start_status_poll()
+            if self._sched_job is None:
+                self._start_sched_poll()
         if running:
             self._status_dot.setStyleSheet(
                 "color: #3ddc84; font-size: 18px;"
@@ -1202,6 +1214,9 @@ class App(QMainWindow):
             ):
                 self._last_sched_restart_date = today
                 self._log(f"Scheduled daily restart at {sched} triggered.")
+                if not self._server_running:
+                    self._log("Scheduled restart skipped — server not running.")
+                    return
                 if self._countdown_active:
                     self._log("Scheduled restart deferred — countdown already active.")
                 else:

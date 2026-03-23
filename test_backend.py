@@ -496,5 +496,192 @@ class TestFindLatestLog(unittest.TestCase):
             self.assertIsNone(result)
 
 
+# ---------------------------------------------------------------------------
+# Poll-guard logic tests  (no Qt import — uses a lightweight stub)
+# ---------------------------------------------------------------------------
+
+class _FakeManager:
+    """Minimal stub for testing poll-guard logic without importing Qt."""
+
+    def __init__(self, server_dir="", rcon_path="", server_ip="", password="",
+                 server_running=None):
+        cfg = AppConfig()
+        cfg.server_dir = server_dir
+        cfg.rcon_path = rcon_path
+        cfg.server_ip = server_ip
+        cfg.password = password
+        self.config = cfg
+        self._server_running = server_running
+        self._poll_status_job = None
+        self._sched_job = None
+        self._started = []
+        self._log_messages = []
+        self._last_sched_restart_date = None
+        self._countdown_active = False
+        self._restart_called = False
+
+    # --- methods under test (inlined from gui.py to avoid Qt import) ---
+
+    def _config_is_ready(self):
+        c = self.config
+        return bool(c.server_dir and c.rcon_path and c.server_ip and c.password)
+
+    def _start_status_poll(self):
+        self._started.append("status")
+        self._poll_status_job = object()
+
+    def _start_sched_poll(self):
+        self._started.append("sched")
+        self._sched_job = object()
+
+    def _log(self, msg):
+        self._log_messages.append(msg)
+
+    def _restart_server(self):
+        self._restart_called = True
+
+    def _set_status(self, running: bool):
+        """Mirrors gui.py PZManager._set_status poll-guard logic."""
+        self._server_running = running
+        if running and self._config_is_ready():
+            if self._poll_status_job is None:
+                self._start_status_poll()
+            if self._sched_job is None:
+                self._start_sched_poll()
+
+    def _save_config_poll_guard(self):
+        """Mirrors the poll-start block added to gui.py _save_config."""
+        if self._config_is_ready():
+            if self._server_running:
+                if self._poll_status_job is None:
+                    self._start_status_poll()
+                if self._sched_job is None:
+                    self._start_sched_poll()
+
+    def _check_scheduled_restart_guard(self, server_running):
+        """Mirrors the new running-guard in gui.py _check_scheduled_restart."""
+        self._server_running = server_running
+        if not self._server_running:
+            self._log("Scheduled restart skipped — server not running.")
+            return
+        if self._countdown_active:
+            self._log("Scheduled restart deferred — countdown already active.")
+        else:
+            self._restart_server()
+
+
+def _ready_manager(**kwargs):
+    """Return a _FakeManager with all required config fields set."""
+    return _FakeManager(
+        server_dir=r"C:\pz_server",
+        rcon_path=r"C:\rcon.exe",
+        server_ip="127.0.0.1",
+        password="secret",
+        **kwargs,
+    )
+
+
+class TestPollGuard(unittest.TestCase):
+    """Tests for the poll-start guard logic in _set_status and _save_config."""
+
+    # --- _set_status paths ---
+
+    def test_set_status_starts_both_polls_when_running_and_config_ready(self):
+        m = _ready_manager()
+        m._set_status(True)
+        self.assertIn("status", m._started)
+        self.assertIn("sched", m._started)
+        self.assertIsNotNone(m._poll_status_job)
+        self.assertIsNotNone(m._sched_job)
+
+    def test_set_status_skips_polls_when_server_stopped(self):
+        m = _ready_manager()
+        m._set_status(False)
+        self.assertEqual(m._started, [])
+        self.assertIsNone(m._poll_status_job)
+        self.assertIsNone(m._sched_job)
+
+    def test_set_status_skips_polls_when_config_not_ready(self):
+        m = _FakeManager()  # no config fields set
+        m._set_status(True)
+        self.assertEqual(m._started, [])
+
+    def test_set_status_double_start_guard_status_poll(self):
+        m = _ready_manager()
+        sentinel = object()
+        m._poll_status_job = sentinel  # already started
+        m._set_status(True)
+        # status poll must not be re-created
+        self.assertIs(m._poll_status_job, sentinel)
+        self.assertNotIn("status", m._started)
+
+    def test_set_status_double_start_guard_sched_poll(self):
+        m = _ready_manager()
+        sentinel = object()
+        m._sched_job = sentinel  # already started
+        m._set_status(True)
+        self.assertIs(m._sched_job, sentinel)
+        self.assertNotIn("sched", m._started)
+
+    def test_set_status_second_call_does_not_double_start(self):
+        m = _ready_manager()
+        m._set_status(True)
+        count_after_first = len(m._started)
+        m._set_status(True)
+        self.assertEqual(len(m._started), count_after_first)
+
+    # --- _save_config poll-guard paths ---
+
+    def test_save_config_starts_polls_when_running_and_config_valid(self):
+        m = _ready_manager(server_running=True)
+        m._save_config_poll_guard()
+        self.assertIn("status", m._started)
+        self.assertIn("sched", m._started)
+
+    def test_save_config_skips_polls_when_server_stopped(self):
+        m = _ready_manager(server_running=False)
+        m._save_config_poll_guard()
+        self.assertEqual(m._started, [])
+
+    def test_save_config_skips_polls_when_server_unknown(self):
+        m = _ready_manager(server_running=None)
+        m._save_config_poll_guard()
+        self.assertEqual(m._started, [])
+
+    def test_save_config_skips_polls_when_config_not_ready(self):
+        m = _FakeManager(server_running=True)  # no config fields
+        m._save_config_poll_guard()
+        self.assertEqual(m._started, [])
+
+    def test_save_config_skips_if_polls_already_running(self):
+        m = _ready_manager(server_running=True)
+        m._poll_status_job = object()
+        m._sched_job = object()
+        m._save_config_poll_guard()
+        self.assertEqual(m._started, [])
+
+
+class TestSchedRestartGuard(unittest.TestCase):
+    """Tests for the server-running guard in _check_scheduled_restart."""
+
+    def test_skips_restart_when_server_not_running(self):
+        m = _ready_manager()
+        m._check_scheduled_restart_guard(server_running=False)
+        self.assertFalse(m._restart_called)
+        self.assertTrue(any("not running" in msg for msg in m._log_messages))
+
+    def test_runs_restart_when_server_running(self):
+        m = _ready_manager()
+        m._check_scheduled_restart_guard(server_running=True)
+        self.assertTrue(m._restart_called)
+
+    def test_defers_restart_when_countdown_active(self):
+        m = _ready_manager()
+        m._countdown_active = True
+        m._check_scheduled_restart_guard(server_running=True)
+        self.assertFalse(m._restart_called)
+        self.assertTrue(any("deferred" in msg for msg in m._log_messages))
+
+
 if __name__ == "__main__":
     unittest.main()
