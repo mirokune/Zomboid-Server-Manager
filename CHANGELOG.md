@@ -3,7 +3,7 @@
 All notable changes are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## v0.1.1 — 2026-03-22
 
 ### Added
 - **Cancel Restart** button in the countdown banner — admins can abort a pending restart and broadcast "Server restart has been cancelled." to players in-game
@@ -22,8 +22,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `_start_restart_countdown()` now guards against double-start; a second call while a countdown is running is ignored
 - `_maybe_early_restart()` checks `_countdown_active` before proceeding and writes `_countdown_remaining` via `_invoke` (cross-thread write fix)
 - `_check_scheduled_restart()` defers the restart if a countdown is already active
-- Three `QTimer.singleShot` calls inside daemon threads are now wrapped in `_invoke()` so they execute on the Qt main thread
+- Three `QTimer.singleShot` calls inside daemon threads are now wrapped in `_invoke()` so they execute on the Qt main thread; server update pipeline post-start timer now correctly routed via `_invoke`
 - Log file is now written to `%APPDATA%\PZServerManager\pz_manager.log` instead of the current working directory
+- `is_running()` now has a 10-second PowerShell timeout — server-control buttons can never be stuck indefinitely; thread-spawn failure now re-enables buttons immediately
+- Log subdirectory search: `find_latest_log` now searches dated subfolders (PZ creates logs under `Logs/YYYY-MM-DD_HH-MM/`) — fixes "No log file found" on most setups
+- Status check retry: `_check_server_status` now schedules a 15-second retry on failure so `_server_running` resolves faster, unblocking the mod-check pipeline; added in-flight guard to prevent concurrent checks from piling up under sustained WMI failure
+- RCON settings fields now show placeholder text for server IP, server name, and password
+- Zero-interval guard: `check_interval` and `server_update_interval` clamped to ≥ 1 min; `steamcmd_timeout` clamped to ≥ 30 s — prevents QTimer busy-loop if 0 is entered
 
 ## v0.1.0 — 2026-03-21
 
