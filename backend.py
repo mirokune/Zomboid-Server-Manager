@@ -302,9 +302,18 @@ class LogParser:
         self.log_directory = log_directory
 
     def find_latest_log(self) -> Optional[str]:
-        """Find the most recently modified DebugLog-server* file."""
-        for pattern in ("DebugLog-server*.txt", "DebugLog-server*"):
-            files = glob(os.path.join(self.log_directory, pattern))
+        """Find the most recently modified DebugLog-server* file.
+
+        Searches subdirectories too (PZ creates dated subfolders like
+        Logs/2024-01-15_14-00/DebugLog-server.txt).
+        """
+        for pattern in (
+            "**/DebugLog-server*.txt",
+            "**/DebugLog-server*",
+            "DebugLog-server*.txt",
+            "DebugLog-server*",
+        ):
+            files = glob(os.path.join(self.log_directory, pattern), recursive=True)
             if files:
                 return max(files, key=os.path.getmtime)
         return None

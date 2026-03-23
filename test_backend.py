@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
 
-from backend import AppConfig, ServerUpdateChecker
+from backend import AppConfig, LogParser, ServerUpdateChecker
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +444,56 @@ class TestAppConfigAtomicSave(unittest.TestCase):
             # No .tmp files left over
             tmp_files = list(Path(tmpdir).glob("*.tmp"))
             self.assertEqual(len(tmp_files), 0)
+
+
+# ---------------------------------------------------------------------------
+# LogParser.find_latest_log
+# ---------------------------------------------------------------------------
+
+class TestFindLatestLog(unittest.TestCase):
+
+    def test_finds_log_in_top_level_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = os.path.join(tmpdir, "DebugLog-server.txt")
+            open(log, "w").close()
+            result = LogParser(tmpdir).find_latest_log()
+            self.assertEqual(os.path.abspath(result), os.path.abspath(log))
+
+    def test_finds_log_in_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subdir = os.path.join(tmpdir, "2024-01-15_14-00")
+            os.makedirs(subdir)
+            log = os.path.join(subdir, "DebugLog-server.txt")
+            open(log, "w").close()
+            result = LogParser(tmpdir).find_latest_log()
+            self.assertEqual(os.path.abspath(result), os.path.abspath(log))
+
+    def test_returns_most_recent_when_multiple_logs_exist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_dir = os.path.join(tmpdir, "2024-01-14_12-00")
+            new_dir = os.path.join(tmpdir, "2024-01-15_14-00")
+            os.makedirs(old_dir)
+            os.makedirs(new_dir)
+            old_log = os.path.join(old_dir, "DebugLog-server.txt")
+            new_log = os.path.join(new_dir, "DebugLog-server.txt")
+            open(old_log, "w").close()
+            import time as _time
+            _time.sleep(0.01)
+            open(new_log, "w").close()
+            result = LogParser(tmpdir).find_latest_log()
+            self.assertEqual(os.path.abspath(result), os.path.abspath(new_log))
+
+    def test_returns_none_when_no_logs_exist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = LogParser(tmpdir).find_latest_log()
+            self.assertIsNone(result)
+
+    def test_ignores_non_matching_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            open(os.path.join(tmpdir, "server.log"), "w").close()
+            open(os.path.join(tmpdir, "DebugLog-client.txt"), "w").close()
+            result = LogParser(tmpdir).find_latest_log()
+            self.assertIsNone(result)
 
 
 if __name__ == "__main__":
