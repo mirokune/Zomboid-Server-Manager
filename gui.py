@@ -395,6 +395,7 @@ class App(QMainWindow):
 
         self._last_sched_restart_date: Optional[date] = None
         self._server_running: Optional[bool] = None  # None = not yet known
+        self._status_check_in_flight: bool = False   # prevents concurrent checks piling up
         self._auto_check_job: Optional[QTimer] = None
         self._server_update_check_job: Optional[QTimer] = None
         self._poll_status_job: Optional[QTimer] = None
@@ -990,16 +991,16 @@ class App(QMainWindow):
         self.config.server_ip     = e["server_ip"].text()
         self.config.password      = e["password"].text()
         try:
-            self.config.check_interval = int(e["check_interval"].text())
+            self.config.check_interval = max(1, int(e["check_interval"].text()))
         except ValueError:
             self.config.check_interval = 60
         self.config.steamcmd_path = e["steamcmd_path"].text()
         try:
-            self.config.server_update_interval = int(e["server_update_interval"].text())
+            self.config.server_update_interval = max(1, int(e["server_update_interval"].text()))
         except ValueError:
             self.config.server_update_interval = 60
         try:
-            self.config.steamcmd_timeout = int(e["steamcmd_timeout"].text())
+            self.config.steamcmd_timeout = max(30, int(e["steamcmd_timeout"].text()))
         except ValueError:
             self.config.steamcmd_timeout = 600
 
@@ -1031,6 +1032,9 @@ class App(QMainWindow):
     # ------------------------------------------------------------------
 
     def _check_server_status_threaded(self) -> None:
+        if self._status_check_in_flight:
+            return
+        self._status_check_in_flight = True
         self._status_text.setText("Checking…")
         self._status_dot.setStyleSheet("color: #f0a030; font-size: 18px;")
         threading.Thread(target=self._check_server_status, daemon=True).start()
@@ -1041,12 +1045,17 @@ class App(QMainWindow):
             running = self.server.is_running()
         except _sp.TimeoutExpired:
             self._invoke(lambda: self._set_status_error(
-                "PowerShell timed out — WMI may be busy. Retrying next poll."
+                "PowerShell timed out — WMI may be busy. Retrying in 15 s."
             ))
+            self._invoke(lambda: setattr(self, "_status_check_in_flight", False))
+            self._invoke(lambda: QTimer.singleShot(15_000, self._check_server_status_threaded))
             return False
         except Exception as exc:
-            self._invoke(lambda e=exc: self._set_status_error(str(e)))
+            self._invoke(lambda e=exc: self._set_status_error(f"{e} — Retrying in 15 s."))
+            self._invoke(lambda: setattr(self, "_status_check_in_flight", False))
+            self._invoke(lambda: QTimer.singleShot(15_000, self._check_server_status_threaded))
             return False
+        self._invoke(lambda: setattr(self, "_status_check_in_flight", False))
         self._invoke(lambda r=running: self._set_status(r))
         return running
 
@@ -1105,7 +1114,11 @@ class App(QMainWindow):
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
-        threading.Thread(target=_do, daemon=True).start()
+        try:
+            threading.Thread(target=_do, daemon=True).start()
+        except Exception as exc:
+            self._log(f"Could not spawn start thread: {exc}")
+            self._set_control_buttons(True)
 
     def _stop_server(self) -> None:
         self._log("Sending stop command…")
@@ -1121,7 +1134,11 @@ class App(QMainWindow):
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
-        threading.Thread(target=_do, daemon=True).start()
+        try:
+            threading.Thread(target=_do, daemon=True).start()
+        except Exception as exc:
+            self._log(f"Could not spawn stop thread: {exc}")
+            self._set_control_buttons(True)
 
     def _restart_server(self) -> None:
         self._log("Restarting server…")
@@ -1140,7 +1157,11 @@ class App(QMainWindow):
             finally:
                 self._invoke(lambda: self._set_control_buttons(True))
 
-        threading.Thread(target=_do, daemon=True).start()
+        try:
+            threading.Thread(target=_do, daemon=True).start()
+        except Exception as exc:
+            self._log(f"Could not spawn restart thread: {exc}")
+            self._set_control_buttons(True)
 
     # ------------------------------------------------------------------
     # Auto-refresh server status
@@ -1572,7 +1593,7 @@ class App(QMainWindow):
             try:
                 self.server.start()
                 self._invoke(lambda: self._log("Server start command sent."))
-                QTimer.singleShot(5000, self._check_server_status_threaded)
+                self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
                 self._invoke(lambda e=exc: self._log(f"Server start failed: {e}"))
 
