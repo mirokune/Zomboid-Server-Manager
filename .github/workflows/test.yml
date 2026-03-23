@@ -22,3 +22,28 @@ jobs:
 
       - name: Run tests
         run: python -m pytest test_backend.py -v
+
+  build:
+    needs: test             # only build if tests pass
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build portable EXE
+        run: pyinstaller PZServerManager.spec
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PZServerManager-dev-build
+          path: dist/PZServerManager.exe
+          retention-days: 7
