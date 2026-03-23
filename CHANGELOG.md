@@ -3,6 +3,20 @@
 All notable changes are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## v0.1.2 — 2026-03-23
+
+### Added
+- **Steam Branch selector** in Settings — choose `public`, `unstable`, or `outdatedunstable`; the update checker now compares against the correct branch's remote build ID instead of always comparing against `public`
+- Branch-aware `+app_update`: when a non-public branch is selected, SteamCMD is now invoked with `-beta <branch>` so updates install from the correct branch instead of silently downgrading to `public`
+
+### Changed
+- `get_installed_buildid()` now calls SteamCMD `+app_status` instead of reading `appmanifest_380870.acf` from disk — reports the same build ID Steam uses, works regardless of install location, and guards against misidentifying unrelated `BuildID` tokens in SteamCMD preamble output
+- VDF parsing in `get_remote_buildid()` now navigates `depots > branches > <branch> > buildid` rather than grabbing the first `buildid` in the `common` section
+
+### Fixed
+- Scheduled restart no longer fires when the server is already stopped (pre-existing bug)
+- Status poll and scheduled-restart poll no longer start unconditionally at app startup — both now require config to be valid and the server to be running first, eliminating false-positive "server running" readings on unconfigured installs
+
 ## v0.1.1 — 2026-03-22
 
 ### Added
