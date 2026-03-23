@@ -825,6 +825,25 @@ class App(QMainWindow):
         _timing_row("Server Update Interval (min):", "server_update_interval")
         _timing_row("SteamCMD Timeout (sec):",       "steamcmd_timeout")
 
+        # Steam branch row
+        branch_row = QHBoxLayout()
+        branch_row.setSpacing(8)
+        branch_lbl = QLabel("Steam Branch:")
+        branch_lbl.setFixedWidth(200)
+        branch_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        branch_lbl.setStyleSheet("color: #888;")
+        self._steam_branch_combo = QComboBox()
+        self._steam_branch_combo.addItems(["public", "unstable", "outdatedunstable"])
+        self._steam_branch_combo.setFixedWidth(160)
+        self._steam_branch_combo.currentTextChanged.connect(self._on_settings_changed)
+        branch_hint = QLabel("Which Steam branch your server runs on")
+        branch_hint.setStyleSheet("color: #444; font-size: 11px;")
+        branch_row.addWidget(branch_lbl)
+        branch_row.addWidget(self._steam_branch_combo)
+        branch_row.addWidget(branch_hint)
+        branch_row.addStretch()
+        sched_layout.addLayout(branch_row)
+
         # Scheduled restart row
         sched_row = QHBoxLayout()
         sched_row.setSpacing(8)
@@ -943,6 +962,11 @@ class App(QMainWindow):
         put("server_update_interval", str(cfg.server_update_interval))
         put("steamcmd_timeout",       str(cfg.steamcmd_timeout))
 
+        self._steam_branch_combo.blockSignals(True)
+        idx = self._steam_branch_combo.findText(cfg.steam_branch)
+        self._steam_branch_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._steam_branch_combo.blockSignals(False)
+
         if cfg.last_update:
             self._mod_last_label.setText(f"Last checked: {cfg.last_update}")
         if cfg.last_server_update_check:
@@ -1003,6 +1027,8 @@ class App(QMainWindow):
             self.config.steamcmd_timeout = max(30, int(e["steamcmd_timeout"].text()))
         except ValueError:
             self.config.steamcmd_timeout = 600
+
+        self.config.steam_branch = self._steam_branch_combo.currentText()
 
         hour_val = self._sched_hour.currentText()
         self.config.scheduled_restart = (

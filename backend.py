@@ -65,6 +65,7 @@ class AppConfig:
         self.server_update_interval: int = 60
         self.steamcmd_timeout: int = 600
         self.last_server_update_check: str = ""
+        self.steam_branch: str = "public"
         self._save_lock = threading.Lock()
 
     def load(self):
@@ -110,6 +111,7 @@ class AppConfig:
         except ValueError:
             self.steamcmd_timeout = 600
         self.last_server_update_check = s.get("last_server_update_check", "")
+        self.steam_branch = s.get("steam_branch", "public")
 
         # If old config had a plaintext password, migrate it to Credential Manager
         # and remove it from the INI.
@@ -168,6 +170,7 @@ class AppConfig:
             "server_update_interval": str(self.server_update_interval),
             "steamcmd_timeout": str(self.steamcmd_timeout),
             "last_server_update_check": self.last_server_update_check,
+            "steam_branch": self.steam_branch,
         }
         dest = _config_path()
         dest_dir = os.path.dirname(dest)
@@ -518,8 +521,8 @@ class ServerUpdateChecker:
     Detects and applies Project Zomboid dedicated server updates via SteamCMD.
 
     Build ID comparison flow:
-      installed buildid  ←  steamapps/appmanifest_380870.acf
-      remote buildid     ←  steamcmd +app_info_print 380870
+      installed buildid  ←  steamcmd +app_status 380870 (reads local depot DB)
+      remote buildid     ←  steamcmd +app_info_print 380870 (depots > branches > {branch})
 
     If installed != remote → update needed.
     If either is None (parse failure) → unknown, do not auto-update.
@@ -534,30 +537,118 @@ class ServerUpdateChecker:
 
     def get_installed_buildid(self) -> Optional[str]:
         """
-        Read buildid from <server_dir>/steamapps/appmanifest_380870.acf.
-        Returns None if the file is missing or the buildid key is absent.
+        Query SteamCMD for the locally installed buildid.
+
+        Runs: steamcmd +login anonymous +force_install_dir <server_dir>
+                       +app_status 380870 +quit
+
+        Parses the output line matching: BuildID : <digits>
+
+        Returns None if steamcmd_path or server_dir is not configured,
+        if the output contains no BuildID, or if the subprocess fails.
+        Timeout: 30s.
         """
-        acf_path = os.path.join(
-            self.config.server_dir,
-            "steamapps",
-            f"appmanifest_{self.APP_ID}.acf",
-        )
+        if not self.config.steamcmd_path or not self.config.server_dir:
+            return None
+        server_dir_norm = os.path.normpath(self.config.server_dir)
         try:
-            with open(acf_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    m = re.search(r'"buildid"\s+"(\d+)"', line)
-                    if m:
-                        return m.group(1)
-        except OSError:
-            logger.debug("appmanifest not found at: %s", acf_path)
+            result = subprocess.run(
+                [
+                    self.config.steamcmd_path,
+                    "+login", "anonymous",
+                    "+force_install_dir", server_dir_norm,
+                    "+app_status", self.APP_ID,
+                    "+quit",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                **_SUBPROCESS_FLAGS,
+            )
+            output = result.stdout + result.stderr
+            for line in output.splitlines():
+                m = re.search(r'BuildID\s*:\s*(\d+)', line, re.IGNORECASE)
+                if m:
+                    return m.group(1)
+            logger.debug("SteamCMD app_status output (no BuildID found):\n%s", output[:2000])
+        except subprocess.TimeoutExpired:
+            logger.warning("SteamCMD app_status timed out after 30s.")
+        except Exception as exc:
+            logger.warning("SteamCMD get_installed_buildid failed: %s", exc)
+        return None
+
+    @staticmethod
+    def _parse_branch_buildid(text: str, branch: str) -> Optional[str]:
+        """
+        Parse the buildid for a specific Steam branch from +app_info_print VDF output.
+
+        Navigates the path: depots > branches > {branch} > buildid
+
+        VDF structure (depth-tracked via { / } counts):
+
+            "depots"
+            {
+                "branches"
+                {
+                    "public"
+                    {
+                        "buildid"    "12345"
+                    }
+                    "unstable"
+                    {
+                        "buildid"    "67890"
+                    }
+                }
+            }
+
+        Returns None if the branch key or buildid is absent.
+        """
+        WANT_DEPOTS, WANT_BRANCHES, WANT_BRANCH, WANT_BUILDID = range(4)
+        state = WANT_DEPOTS
+        depth = 0
+        section_depth = 0
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped == "{":
+                depth += 1
+                continue
+            if stripped == "}":
+                depth -= 1
+                if state == WANT_BRANCHES and depth < section_depth:
+                    state = WANT_DEPOTS
+                elif state == WANT_BRANCH and depth < section_depth:
+                    state = WANT_BRANCHES
+                elif state == WANT_BUILDID and depth < section_depth:
+                    state = WANT_BRANCHES
+                continue
+
+            if state == WANT_DEPOTS:
+                if re.search(r'^\s*"depots"\s*$', line):
+                    state = WANT_BRANCHES
+                    section_depth = depth + 1
+            elif state == WANT_BRANCHES:
+                if re.search(r'^\s*"branches"\s*$', line):
+                    state = WANT_BRANCH
+                    section_depth = depth + 1
+            elif state == WANT_BRANCH:
+                if re.search(rf'^\s*"{re.escape(branch)}"\s*$', line):
+                    state = WANT_BUILDID
+                    section_depth = depth + 1
+            elif state == WANT_BUILDID:
+                m = re.search(r'^\s*"buildid"\s+"(\d+)"', line)
+                if m:
+                    return m.group(1)
+
         return None
 
     def get_remote_buildid(self) -> Optional[str]:
         """
-        Query SteamCMD for the current depot buildid.
+        Query SteamCMD for the remote buildid on the configured Steam branch.
 
-        Parses each output line with:
-            re.search(r'^\\s+"buildid"\\s+"(\\d+)"', line)
+        Runs: steamcmd +login anonymous +app_info_print 380870 +quit
+
+        Parses VDF output for: depots > branches > {steam_branch} > buildid
 
         Timeout: 30s. On failure, increments _consecutive_failures.
         After _MAX_FAILURES consecutive failures, logs a WARNING.
@@ -565,6 +656,7 @@ class ServerUpdateChecker:
         """
         if not self.config.steamcmd_path:
             return None
+        branch = getattr(self.config, "steam_branch", "public") or "public"
         try:
             result = subprocess.run(
                 [
@@ -579,18 +671,13 @@ class ServerUpdateChecker:
                 **_SUBPROCESS_FLAGS,
             )
             output = result.stdout + result.stderr
-            # Only match buildid lines that appear after the app ID header in the
-            # output, so we never pick up a stray match from SteamCMD preamble text.
-            in_app_section = False
-            for line in output.splitlines():
-                if f'"{self.APP_ID}"' in line:
-                    in_app_section = True
-                if in_app_section:
-                    m = re.search(r'^\s+"buildid"\s+"(\d+)"', line)
-                    if m:
-                        self._consecutive_failures = 0
-                        return m.group(1)
-            logger.debug("SteamCMD output (no buildid found):\n%s", output[:2000])
+            buildid = self._parse_branch_buildid(output, branch)
+            if buildid is not None:
+                self._consecutive_failures = 0
+                return buildid
+            logger.debug(
+                "SteamCMD output (no buildid for branch '%s'):\n%s", branch, output[:2000]
+            )
         except subprocess.TimeoutExpired:
             logger.warning("SteamCMD app_info_print timed out after 30s.")
         except Exception as exc:

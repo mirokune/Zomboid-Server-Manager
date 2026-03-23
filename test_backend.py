@@ -13,7 +13,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, patch
 
 from backend import AppConfig, LogParser, ServerUpdateChecker
 
@@ -31,12 +31,36 @@ def _make_config(**kwargs) -> AppConfig:
     return cfg
 
 
-ACF_CONTENT_12345 = '''"AppState"\n{\n\t"appid"\t\t"380870"\n\t"buildid"\t\t"12345"\n}\n'''
-ACF_CONTENT_NO_BUILDID = '"AppState"\n{\n\t"appid"\t\t"380870"\n}\n'
-ACF_CONTENT_MALFORMED = "not valid acf content at all"
+APP_STATUS_OUTPUT_12345 = (
+    "AppID 380870 scheduler :\n"
+    " - update required : 0\n"
+    "  BuildID : 12345\n"
+    " disk usage : 10.5 GB\n"
+)
 
+# Full VDF output with depots > branches > public/unstable buildids.
 STEAMCMD_OUTPUT_99999 = (
-    '"380870"\n{\n\t"common"\n\t{\n\t\t"buildid"\t\t"99999"\n\t}\n}\n'
+    '"380870"\n'
+    '{\n'
+    '\t"common"\n'
+    '\t{\n'
+    '\t\t"name"\t\t"Project Zomboid Dedicated Server"\n'
+    '\t}\n'
+    '\t"depots"\n'
+    '\t{\n'
+    '\t\t"branches"\n'
+    '\t\t{\n'
+    '\t\t\t"public"\n'
+    '\t\t\t{\n'
+    '\t\t\t\t"buildid"\t\t"99999"\n'
+    '\t\t\t}\n'
+    '\t\t\t"unstable"\n'
+    '\t\t\t{\n'
+    '\t\t\t\t"buildid"\t\t"88888"\n'
+    '\t\t\t}\n'
+    '\t\t}\n'
+    '\t}\n'
+    '}\n'
 )
 STEAMCMD_OUTPUT_NO_BUILDID = "Some SteamCMD output without the key we need.\n"
 
@@ -50,46 +74,98 @@ class TestGetInstalledBuildid(unittest.TestCase):
     def _checker(self, **kwargs):
         return ServerUpdateChecker(_make_config(**kwargs))
 
-    def test_returns_buildid_when_acf_exists(self):
+    def _fake_run(self, stdout="", returncode=0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = ""
+        result.returncode = returncode
+        return result
+
+    def test_returns_buildid_from_app_status(self):
         checker = self._checker()
-        m = mock_open(read_data=ACF_CONTENT_12345)
-        with patch("builtins.open", m):
+        with patch("subprocess.run", return_value=self._fake_run(APP_STATUS_OUTPUT_12345)):
             result = checker.get_installed_buildid()
         self.assertEqual(result, "12345")
 
-    def test_returns_none_when_file_not_found(self):
+    def test_returns_none_when_no_buildid_in_output(self):
         checker = self._checker()
-        with patch("builtins.open", side_effect=OSError("not found")):
+        with patch("subprocess.run", return_value=self._fake_run(STEAMCMD_OUTPUT_NO_BUILDID)):
             result = checker.get_installed_buildid()
         self.assertIsNone(result)
 
-    def test_returns_none_when_no_buildid_key(self):
+    def test_returns_none_on_timeout(self):
         checker = self._checker()
-        m = mock_open(read_data=ACF_CONTENT_NO_BUILDID)
-        with patch("builtins.open", m):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="steamcmd", timeout=30)):
             result = checker.get_installed_buildid()
         self.assertIsNone(result)
 
-    def test_returns_none_when_malformed_content(self):
+    def test_returns_none_on_exception(self):
         checker = self._checker()
-        m = mock_open(read_data=ACF_CONTENT_MALFORMED)
-        with patch("builtins.open", m):
+        with patch("subprocess.run", side_effect=FileNotFoundError("steamcmd not found")):
             result = checker.get_installed_buildid()
         self.assertIsNone(result)
 
-    def test_uses_server_dir_in_path(self):
+    def test_returns_none_when_steamcmd_path_missing(self):
+        checker = self._checker(steamcmd_path="")
+        result = checker.get_installed_buildid()
+        self.assertIsNone(result)
+
+    def test_returns_none_when_server_dir_missing(self):
+        checker = self._checker(server_dir="")
+        result = checker.get_installed_buildid()
+        self.assertIsNone(result)
+
+    def test_uses_server_dir_in_force_install_dir_arg(self):
         checker = self._checker(server_dir=r"D:\my_server")
-        captured_paths = []
+        captured = []
 
-        def fake_open(path, *args, **kwargs):
-            captured_paths.append(path)
-            raise OSError("not found")
+        def fake_run(args, **kwargs):
+            captured.extend(args)
+            raise subprocess.TimeoutExpired(cmd="steamcmd", timeout=30)
 
-        with patch("builtins.open", fake_open):
+        with patch("subprocess.run", side_effect=fake_run):
             checker.get_installed_buildid()
 
-        self.assertTrue(any("my_server" in p for p in captured_paths))
-        self.assertTrue(any("appmanifest_380870.acf" in p for p in captured_paths))
+        self.assertIn("+force_install_dir", captured)
+        norm = os.path.normpath(r"D:\my_server")
+        self.assertIn(norm, captured)
+
+
+# ---------------------------------------------------------------------------
+# ServerUpdateChecker._parse_branch_buildid
+# ---------------------------------------------------------------------------
+
+class TestParseBranchBuildid(unittest.TestCase):
+
+    def test_returns_buildid_for_public_branch(self):
+        result = ServerUpdateChecker._parse_branch_buildid(STEAMCMD_OUTPUT_99999, "public")
+        self.assertEqual(result, "99999")
+
+    def test_returns_buildid_for_unstable_branch(self):
+        result = ServerUpdateChecker._parse_branch_buildid(STEAMCMD_OUTPUT_99999, "unstable")
+        self.assertEqual(result, "88888")
+
+    def test_returns_none_when_branch_not_found(self):
+        result = ServerUpdateChecker._parse_branch_buildid(STEAMCMD_OUTPUT_99999, "outdatedunstable")
+        self.assertIsNone(result)
+
+    def test_returns_none_when_depots_section_absent(self):
+        text = '"380870"\n{\n\t"common"\n\t{\n\t\t"name"\t\t"PZ Server"\n\t}\n}\n'
+        result = ServerUpdateChecker._parse_branch_buildid(text, "public")
+        self.assertIsNone(result)
+
+    def test_returns_none_on_empty_string(self):
+        result = ServerUpdateChecker._parse_branch_buildid("", "public")
+        self.assertIsNone(result)
+
+    def test_handles_steamcmd_preamble_before_app_block(self):
+        text = (
+            "Steam>Logging in user 'anonymous' to Steam Public...\n"
+            "Logged in OK\n"
+            + STEAMCMD_OUTPUT_99999
+        )
+        result = ServerUpdateChecker._parse_branch_buildid(text, "public")
+        self.assertEqual(result, "99999")
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +250,32 @@ class TestGetRemoteBuildid(unittest.TestCase):
         output = (
             "Steam>Logging in user 'anonymous' to Steam Public...\n"
             "Logged in OK\n"
-            '"380870"\n{\n\t"buildid"\t\t"55555"\n}\n'
+            '"380870"\n'
+            '{\n'
+            '\t"depots"\n'
+            '\t{\n'
+            '\t\t"branches"\n'
+            '\t\t{\n'
+            '\t\t\t"public"\n'
+            '\t\t\t{\n'
+            '\t\t\t\t"buildid"\t\t"55555"\n'
+            '\t\t\t}\n'
+            '\t\t}\n'
+            '\t}\n'
+            '}\n'
         )
         checker = self._checker()
         with patch("subprocess.run", return_value=self._fake_run(output)):
             result = checker.get_remote_buildid()
         self.assertEqual(result, "55555")
+
+    def test_returns_buildid_for_unstable_branch(self):
+        cfg = _make_config()
+        cfg.steam_branch = "unstable"
+        checker = ServerUpdateChecker(cfg)
+        with patch("subprocess.run", return_value=self._fake_run(STEAMCMD_OUTPUT_99999)):
+            result = checker.get_remote_buildid()
+        self.assertEqual(result, "88888")
 
 
 # ---------------------------------------------------------------------------
@@ -330,12 +426,35 @@ class TestAppConfigPersistence(unittest.TestCase):
             self.assertEqual(loaded.steamcmd_timeout, 300)
             self.assertEqual(loaded.last_server_update_check, "2026-03-20 15:00:00")
 
+    def test_steam_branch_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+            config_file = Path(tmpdir) / "pz_server_config.ini"
+
+            cfg = AppConfig()
+            cfg.steam_branch = "unstable"
+
+            import backend
+            _no_legacy = Path(tmpdir) / "nonexistent_legacy.ini"
+            with patch.object(backend, "_config_path", return_value=config_file), \
+                 patch.object(backend, "_legacy_config_path", return_value=_no_legacy), \
+                 patch("backend.keyring.set_password"), \
+                 patch("backend.keyring.get_password", return_value=""), \
+                 patch("backend.keyring.delete_password"):
+                cfg.save()
+
+                loaded = AppConfig()
+                loaded.load()
+
+            self.assertEqual(loaded.steam_branch, "unstable")
+
     def test_defaults_on_fresh_config(self):
         cfg = AppConfig()
         self.assertEqual(cfg.steamcmd_path, "")
         self.assertEqual(cfg.server_update_interval, 60)
         self.assertEqual(cfg.steamcmd_timeout, 600)
         self.assertEqual(cfg.last_server_update_check, "")
+        self.assertEqual(cfg.steam_branch, "public")
 
     def test_invalid_integer_fields_fall_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as tmpdir:
