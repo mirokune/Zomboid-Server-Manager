@@ -51,3 +51,4 @@ pz_manager.log
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+.claude/settings.local.json

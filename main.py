@@ -18,12 +18,33 @@ def _log_path() -> str:
     return str(d / "pz_manager.log")
 
 
-# Configure logging before any other imports
-logging.basicConfig(
-    filename=_log_path(),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+def configure_logging(debug: bool = False) -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # let handlers decide what they emit
+
+    # Prevent duplicate handlers if configure_logging gets called twice
+    if root.handlers:
+        root.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    )
+
+    # File handler: keep everything
+    file_handler = logging.FileHandler(_log_path(), encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    file_handler.setFormatter(fmt)
+
+    # Console handler: quieter by default
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG if debug else logging.WARNING)
+    console_handler.setFormatter(fmt)
+
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+    # Optional: quiet very noisy third-party modules
+    logging.getLogger("keyring").setLevel(logging.WARNING)
 
 # Arbitrary port used as a single-instance mutex.
 # Only one process can bind to this address at a time.
@@ -47,6 +68,11 @@ def _acquire_lock() -> socket.socket | None:
 
 
 def main():
+    debug_mode = "--debug" in sys.argv
+    configure_logging(debug=debug_mode)
+
+    logger = logging.getLogger(__name__)
+    logger.info("Starting PZ Server Manager")
     lock = _acquire_lock()
     if lock is None:
         # Another instance is already running — alert and exit.

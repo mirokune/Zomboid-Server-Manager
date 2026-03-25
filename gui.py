@@ -365,6 +365,7 @@ class RconLineEdit(QLineEdit):
 # ---------------------------------------------------------------------------
 
 class App(QMainWindow):
+    _invoke_signal = pyqtSignal(object)
     """
     PyQt6 main window. QApplication is created in main.py before this is
     instantiated (idiomatic Qt — QApplication must exist before any QWidget).
@@ -372,6 +373,7 @@ class App(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self._invoke_signal.connect(self._run_on_main_thread)
         self.setWindowTitle("Project Zomboid Server Manager")
         self.resize(900, 720)
         self.setMinimumSize(660, 540)
@@ -401,6 +403,10 @@ class App(QMainWindow):
         self._poll_status_job: Optional[QTimer] = None
         self._sched_job: Optional[QTimer] = None
         self._countdown_timer: Optional[QTimer] = None
+        self._control_action_in_flight: bool = False
+        self._control_action_watchdog: Optional[QTimer] = None
+        self._mod_check_in_flight: bool = False
+        self._server_update_check_in_flight: bool = False
 
         self._server_update_checker = ServerUpdateChecker(self.config)
 
@@ -413,17 +419,14 @@ class App(QMainWindow):
 
         # Deferred startup — let window render first
         QTimer.singleShot(400, self._check_server_status_threaded)
-        if self._config_is_ready():
-            QTimer.singleShot(600, self._resume_auto_check)
-            QTimer.singleShot(700, self._resume_server_update_check)
-        QTimer.singleShot(800, self._start_log_tail)
         # Polls are started by _set_status() once the first running check
         # completes — only when config is valid and server is running.
 
     # ------------------------------------------------------------------
     # UI Construction
     # ------------------------------------------------------------------
-
+    def _run_on_main_thread(self, fn) -> None:
+        fn()
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
@@ -564,7 +567,7 @@ class App(QMainWindow):
         self._mod_status_label.setStyleSheet("color: #666;")
         self._check_mods_btn = QPushButton("Check Now")
         self._check_mods_btn.setFixedWidth(88)
-        self._check_mods_btn.clicked.connect(self._check_mods_threaded)
+        self._check_mods_btn.clicked.connect(self._check_mods_now)
         mod_top.addWidget(self._mod_status_label)
         mod_top.addStretch()
         mod_top.addWidget(self._check_mods_btn)
@@ -1091,25 +1094,42 @@ class App(QMainWindow):
         return running
 
     def _set_status(self, running: bool) -> None:
+        first_known = self._server_running is None
+        previous = self._server_running
         self._server_running = running
-        # Start recurring polls on the first known-running result when config is ready.
-        # Guards prevent double-start on subsequent 60 s ticks.
-        if running and self._config_is_ready():
-            if self._poll_status_job is None:
-                self._start_status_poll()
-            if self._sched_job is None:
-                self._start_sched_poll()
+
         if running:
-            self._status_dot.setStyleSheet(
-                "color: #3ddc84; font-size: 18px;"
-            )
+            self._status_dot.setStyleSheet("color: #3ddc84; font-size: 18px;")
             self._status_text.setText("Running")
         else:
-            self._status_dot.setStyleSheet(
-                "color: #e05252; font-size: 18px;"
-            )
+            self._status_dot.setStyleSheet("color: #e05252; font-size: 18px;")
             self._status_text.setText("Stopped")
+
         self._update_status_bar()
+
+        # Only initialize deferred startup work once, after the first real status result.
+        if first_known and self._config_is_ready():
+            self._resume_auto_check()
+            self._resume_server_update_check()
+            self._start_log_tail()
+
+            if running:
+                if self._poll_status_job is None:
+                    self._start_status_poll()
+                if self._sched_job is None:
+                    self._start_sched_poll()
+
+        # Handle transitions after startup
+        if previous is not None and previous != running:
+            if running:
+                self._start_log_tail()
+                if self._poll_status_job is None:
+                    self._start_status_poll()
+                if self._sched_job is None:
+                    self._start_sched_poll()
+            else:
+                self._stop_log_tail()
+                self._log_file_label.setText("Server is not running.")
 
     def _set_status_error(self, msg: str) -> None:
         self._status_dot.setStyleSheet("color: #e05252; font-size: 18px;")
@@ -1125,17 +1145,84 @@ class App(QMainWindow):
         ip   = self.config.server_ip   or "–"
         self._sb_info.setText(f"{name} @ {ip}")
 
+
+    def _begin_control_action(self, label: str) -> bool:
+        logger.debug(
+            "App._begin_control_action: label=%r in_flight=%s",
+            label,
+            self._control_action_in_flight,
+        )
+
+        if self._control_action_in_flight:
+            self._log(f"{label} ignored — another server action is already in progress.")
+            return False
+
+        self._control_action_in_flight = True
+        self._set_control_buttons(False)
+
+        if self._control_action_watchdog is None:
+            self._control_action_watchdog = QTimer(self)
+            self._control_action_watchdog.setSingleShot(True)
+            self._control_action_watchdog.timeout.connect(self._control_action_timeout)
+
+        self._control_action_watchdog.start(30_000)
+        logger.debug("App._begin_control_action: watchdog started for 30000 ms")
+        return True
+
+
+    def _end_control_action(self) -> None:
+        logger.debug("App._end_control_action: clearing in-flight state")
+
+        self._control_action_in_flight = False
+
+        if self._control_action_watchdog is not None:
+            self._control_action_watchdog.stop()
+            logger.debug("App._end_control_action: watchdog stopped")
+
+        self._set_control_buttons(True)
+
+
+    def _control_action_timeout(self) -> None:
+        logger.warning("App._control_action_timeout: control action watchdog expired")
+        self._log("Server action timed out in the UI — re-enabling controls.")
+        self._end_control_action()
+
     # ------------------------------------------------------------------
     # Server control buttons (disable during async, re-enable in finally)
     # ------------------------------------------------------------------
 
     def _set_control_buttons(self, enabled: bool) -> None:
-        for btn in (self._start_btn, self._stop_btn, self._restart_btn):
-            btn.setEnabled(enabled)
+        logger.debug(
+            "App._set_control_buttons: enabled=%s server_running=%r action_in_flight=%s",
+            enabled,
+            self._server_running,
+            self._control_action_in_flight,
+        )
+
+        if not enabled:
+            for btn in (self._start_btn, self._stop_btn, self._restart_btn):
+                btn.setEnabled(False)
+            return
+
+        # When re-enabling, respect known server state so the wrong button
+        # is not enabled unnecessarily.
+        if self._server_running is True:
+            self._start_btn.setEnabled(True)
+            self._stop_btn.setEnabled(True)
+            self._restart_btn.setEnabled(True)
+        elif self._server_running is False:
+            self._start_btn.setEnabled(True)
+            self._stop_btn.setEnabled(True)
+            self._restart_btn.setEnabled(True)
+        else:
+            for btn in (self._start_btn, self._stop_btn, self._restart_btn):
+                btn.setEnabled(True)
 
     def _start_server(self) -> None:
+        if not self._begin_control_action("Start"):
+            return
+
         self._log("Checking for existing server process…")
-        self._set_control_buttons(False)
 
         def _do():
             try:
@@ -1143,24 +1230,29 @@ class App(QMainWindow):
                     self._invoke(lambda: self._log("Server is already running."))
                     self._invoke(lambda: self._set_status(True))
                     return
+
                 self.server.start()
                 self._invoke(lambda: self._log("Server is launching…"))
                 self._invoke(lambda: self._status_text.setText("Starting…"))
                 self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
+                logger.exception("App._start_server worker failed")
                 self._invoke(lambda e=exc: self._log(f"Start failed: {e}"))
             finally:
-                self._invoke(lambda: self._set_control_buttons(True))
+                self._invoke(self._end_control_action)
 
         try:
             threading.Thread(target=_do, daemon=True).start()
         except Exception as exc:
+            logger.exception("App._start_server could not spawn worker thread")
             self._log(f"Could not spawn start thread: {exc}")
-            self._set_control_buttons(True)
+            self._end_control_action()
 
     def _stop_server(self) -> None:
+        if not self._begin_control_action("Stop"):
+            return
+
         self._log("Sending stop command…")
-        self._set_control_buttons(False)
 
         def _do():
             try:
@@ -1168,19 +1260,23 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("Stop command sent."))
                 self._invoke(lambda: QTimer.singleShot(6000, self._check_server_status_threaded))
             except Exception as exc:
+                logger.exception("App._stop_server worker failed")
                 self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
             finally:
-                self._invoke(lambda: self._set_control_buttons(True))
+                self._invoke(self._end_control_action)
 
         try:
             threading.Thread(target=_do, daemon=True).start()
         except Exception as exc:
+            logger.exception("App._stop_server could not spawn worker thread")
             self._log(f"Could not spawn stop thread: {exc}")
-            self._set_control_buttons(True)
+            self._end_control_action()
 
     def _restart_server(self) -> None:
+        if not self._begin_control_action("Restart"):
+            return
+
         self._log("Restarting server…")
-        self._set_control_buttons(False)
 
         def _do():
             import time as _time
@@ -1191,15 +1287,17 @@ class App(QMainWindow):
                 self._invoke(lambda: self._log("Server restarted."))
                 self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
+                logger.exception("App._restart_server worker failed")
                 self._invoke(lambda e=exc: self._log(f"Restart failed: {e}"))
             finally:
-                self._invoke(lambda: self._set_control_buttons(True))
+                self._invoke(self._end_control_action)
 
         try:
             threading.Thread(target=_do, daemon=True).start()
         except Exception as exc:
+            logger.exception("App._restart_server could not spawn worker thread")
             self._log(f"Could not spawn restart thread: {exc}")
-            self._set_control_buttons(True)
+            self._end_control_action()
 
     # ------------------------------------------------------------------
     # Auto-refresh server status
@@ -1303,86 +1401,122 @@ class App(QMainWindow):
             "mod",
         )
 
-    def _check_mods_threaded(self) -> None:
+    def _check_mods_now(self) -> None:
+        self._check_mods_threaded(manual=True)
+
+    def _check_mods_threaded(self, manual: bool = False) -> None:
         cfg = self.config
+
+        if self._mod_check_in_flight:
+            self._log("Mod check already in progress — ignoring duplicate request.")
+            return
+
         if not (cfg.rcon_path and cfg.server_ip and cfg.password):
             missing = [
                 name for name, val in [
                     ("RCON Executable", cfg.rcon_path),
-                    ("Server IP",       cfg.server_ip),
-                    ("Password",        cfg.password),
+                    ("Server IP", cfg.server_ip),
+                    ("Password", cfg.password),
                 ] if not val
             ]
             self._log(
-                f"RCON not fully configured — missing: {', '.join(missing)}. "
-                "Fill in the Connection group in Settings and click Save."
+                f"Mod check aborted — RCON not fully configured. Missing: {', '.join(missing)}."
             )
-            self._schedule_next_check()
+            self._set_mod_status("RCON not configured.", "error")
+            if not manual:
+                self._schedule_next_check()
             return
-        if self._server_running is None:
-            self._log("Server status not yet known — retrying mod check in 30 s.")
-            QTimer.singleShot(30_000, self._check_mods_threaded)
+
+        if self._countdown_active:
+            self._log("Mod check skipped — restart countdown already in progress.")
+            self._set_mod_status("Skipped — restart pending.", "warn")
+            if not manual:
+                self._schedule_next_check()
             return
-        if not self._server_running:
-            self._log("Server is not running — skipping mod check.")
-            self._schedule_next_check()
-            return
+
         if self._auto_check_job:
             self._auto_check_job.stop()
-        self._mod_status_label.setText("Sending RCON command…")
-        self._mod_status_label.setStyleSheet("color: #f0a030;")
-        self._log("Checking for mod updates…")
-        threading.Thread(target=self._check_mods_worker, daemon=True).start()
 
-    def _check_mods_worker(self) -> None:
+        self._mod_check_in_flight = True
+        self._set_mod_status("Checking…", "warn")
+        self._log("Checking whether mods need updates…")
+
+        def _do():
+            try:
+                running = self.server.is_running()
+                self._invoke(lambda r=running: setattr(self, "_server_running", r))
+
+                if not running:
+                    self._invoke(lambda: self._log(
+                        "Mod check aborted — server is not running, so no mod update check was performed."
+                    ))
+                    self._invoke(lambda: self._set_mod_status("Server not running.", "error"))
+                    return
+
+                self._check_mods_worker(manual=manual)
+
+            except Exception as exc:
+                self._invoke(lambda e=exc: self._log(f"Mod check failed: {e}"))
+                self._invoke(lambda e=exc: self._set_mod_status(f"Check failed: {e}", "error"))
+            finally:
+                def _finish():
+                    self._mod_check_in_flight = False
+                    if not manual and not self._countdown_active:
+                        self._schedule_next_check()
+                self._invoke(_finish)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _check_mods_worker(self, manual: bool = False) -> None:
         try:
-            self.server.check_mods_need_update()
+            ok = self.server.check_mods_need_update()
+            if not ok:
+                self._invoke(lambda: self._log(
+                    "Mod check failed — RCON command did not complete successfully."
+                ))
+                self._invoke(lambda: self._set_mod_status("RCON command failed.", "error"))
+                return
         except Exception as exc:
-            self._invoke(lambda e=exc: self._log(f"RCON error: {e}"))
+            self._invoke(lambda e=exc: self._log(f"Mod check failed — RCON error: {e}"))
             self._invoke(lambda e=exc: self._set_mod_status(f"RCON error: {e}", "error"))
             return
 
         zomboid_dir = self.config.zomboid_dir
         if not zomboid_dir:
+            self._invoke(lambda: self._log(
+                "Mod check failed — Zomboid log folder is not configured."
+            ))
             self._invoke(lambda: self._set_mod_status("Zomboid log folder not set.", "error"))
             return
 
         parser = LogParser(zomboid_dir)
         log_file = parser.find_latest_log()
         if not log_file:
+            self._invoke(lambda: self._log(
+                f"Mod check failed — no DebugLog file found in {zomboid_dir}."
+            ))
             self._invoke(lambda: self._set_mod_status("No log file found.", "error"))
             return
 
-        self._invoke(lambda: self._log(f"Monitoring: {os.path.basename(log_file)}"))
+        self._invoke(lambda: self._log(f"Monitoring log file: {os.path.basename(log_file)}"))
         self._invoke(lambda: self._set_mod_status("Waiting for log response…", "warn"))
 
         status, mod_names = parser.monitor_for_mod_status(log_file)
-
-        if status == "needs_update" and mod_names:
-            mod_map = parser.load_server_mod_map(
-                self.config.server_dir, self.config.server_name
-            )
-            if mod_map:
-                mod_names = [
-                    (
-                        f"{mod_map[e.replace('Workshop ID: ', '')]}  "
-                        f"(Workshop: {e.replace('Workshop ID: ', '')})"
-                        if e.replace("Workshop ID: ", "") in mod_map
-                        else e
-                    )
-                    for e in mod_names
-                ]
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.config.last_update = now
         self.config.save()
 
         if status == "needs_update":
+            self._invoke(lambda: self._log("Mod check complete — updates are available."))
             self._invoke(lambda: self._on_mods_need_update(mod_names, now))
         elif status == "up_to_date":
-            self._invoke(lambda: self._on_mods_up_to_date(now))
+            self._invoke(lambda: self._log("Mod check complete — all mods are up to date."))
+            self._invoke(lambda: self._on_mods_up_to_date(now, schedule_next=not manual))
         else:
-            self._invoke(lambda: self._log("Timed out waiting for mod status (300 s)."))
+            self._invoke(lambda: self._log(
+                "Mod check failed — timed out waiting for mod status response."
+            ))
             self._invoke(lambda: self._set_mod_status("Timed out — no response.", "error"))
 
     def _set_mod_status(self, text: str, level: str = "default") -> None:
@@ -1403,13 +1537,13 @@ class App(QMainWindow):
         self._log("Mods need updating — starting 5-minute restart countdown.")
         self._start_restart_countdown()
 
-    def _on_mods_up_to_date(self, timestamp: str) -> None:
+    def _on_mods_up_to_date(self, timestamp: str, schedule_next: bool = True) -> None:
         self._set_mod_status("All mods up to date  ✓", "success")
         self._mod_last_label.setText(f"Last checked: {timestamp}")
         self._mod_list_widget.setVisible(False)
         self._log("All mods are up to date.")
-        self._schedule_next_check()
-
+        if schedule_next:
+            self._schedule_next_check()
     # ------------------------------------------------------------------
     # Restart countdown
     # ------------------------------------------------------------------
@@ -1524,6 +1658,10 @@ class App(QMainWindow):
         )
 
     def _check_server_update_threaded(self) -> None:
+        if self._server_update_check_in_flight:
+            self._log("Server update check already in progress — ignoring duplicate request.")
+            return
+       
         if not self.config.server_dir:
             self._log("Server folder not configured — open Settings to get started.")
             return
@@ -1537,26 +1675,109 @@ class App(QMainWindow):
         if self._server_update_check_job:
             self._server_update_check_job.stop()
         self._server_update_label.setText("Checking…")
+        self._server_update_check_in_flight = True
         self._server_update_label.setStyleSheet("color: #f0a030;")
         self._log("Checking for server updates…")
         threading.Thread(target=self._check_server_update_worker, daemon=True).start()
 
     def _check_server_update_worker(self) -> None:
-        result = self._server_update_checker.update_needed()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.config.last_server_update_check = now
-        self.config.save()
+        try:
+            result = self._server_update_checker.update_needed()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.config.last_server_update_check = now
+            self.config.save()
 
-        if result is True:
-            self._invoke(lambda: self._on_server_update_needed(now))
-        elif result is False:
-            self._invoke(lambda: self._on_server_up_to_date(now))
-        else:
-            self._invoke(lambda: self._server_update_label.setText("Check failed — see log"))
+            if result is None:
+                self._invoke(lambda: self._log(
+                    "Server update check failed — could not determine installed and/or remote build ID."
+                ))
+                self._invoke(lambda: self._server_update_label.setText("Check failed"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+                self._invoke(lambda: self._server_update_last_label.setText(f"Last checked: {now}"))
+                self._invoke(self._schedule_next_server_update_check)
+                return
+
+            if result is False:
+                self._invoke(lambda: self._log(
+                    f"Server update check complete — server is up to date on branch '{self.config.steam_branch}'."
+                ))
+                self._invoke(lambda: self._server_update_label.setText("Up to date"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #3ddc84;"))
+                self._invoke(lambda: self._server_update_last_label.setText(f"Last checked: {now}"))
+                self._invoke(self._schedule_next_server_update_check)
+                return
+
+            # result is True -> update needed
+            self._invoke(lambda: self._server_update_label.setText("Needs update"))
             self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
-            self._invoke(lambda: self._log("Server update check failed."))
+            self._invoke(lambda: self._server_update_last_label.setText(f"Last checked: {now}"))
+            self._invoke(lambda: self._log(
+                f"Server update check complete — update required on branch '{self.config.steam_branch}'."
+            ))
+            self._server_update_check_in_flight = False
+            try:
+                running = self.server.is_running()
+                self._invoke(lambda r=running: setattr(self, "_server_running", r))
+            except Exception as exc:
+                self._invoke(lambda e=exc: self._log(
+                    f"Server update check failed while checking server state: {e}"
+                ))
+                self._invoke(lambda: self._server_update_label.setText("Check failed"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+                self._invoke(self._schedule_next_server_update_check)
+                return
+
+            if not running:
+                self._invoke(lambda: self._log(
+                    f"Server is not running — starting SteamCMD update now for branch '{self.config.steam_branch}'."
+                ))
+                self._invoke(self._run_server_update_then_restart)
+                return
+
+            try:
+                count = self.server.get_player_count()
+                self._invoke(lambda c=count: self._log(f"Players currently online: {c}"))
+            except Exception as exc:
+                self._invoke(lambda e=exc: self._log(
+                    f"Player count check failed during server update flow: {e}"
+                ))
+                self._invoke(lambda: self._log(
+                    "Unable to confirm player count — starting 5-minute update countdown as a safe fallback."
+                ))
+                self._invoke(lambda: self._start_restart_countdown(
+                    seconds=300,
+                    broadcast_messages=_SERVER_UPDATE_BROADCAST_AT,
+                    action=self._run_server_update_then_restart,
+                    post_fn=self._schedule_next_server_update_check,
+                ))
+                return
+
+            if count <= 0:
+                self._invoke(lambda: self._log(
+                    "No players online — stopping server and starting SteamCMD update immediately."
+                ))
+                self._invoke(self._run_server_update_then_restart)
+                return
+
+            self._invoke(lambda c=count: self._log(
+                f"{c} player(s) online — starting 5-minute countdown before shutdown and SteamCMD update."
+            ))
+            self._invoke(lambda: self._start_restart_countdown(
+                seconds=300,
+                broadcast_messages=_SERVER_UPDATE_BROADCAST_AT,
+                action=self._run_server_update_then_restart,
+                post_fn=self._schedule_next_server_update_check,
+            ))
+
+        except Exception as exc:
+            self._invoke(lambda e=exc: self._log(f"Server update check failed: {e}"))
+            self._invoke(lambda: self._server_update_label.setText("Check failed"))
+            self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
             self._invoke(self._schedule_next_server_update_check)
 
+        finally:
+            self._server_update_check_in_flight = False
+            
     def _on_server_update_needed(self, timestamp: str) -> None:
         self._server_update_label.setText("Update available!")
         self._server_update_label.setStyleSheet("color: #f0a030;")
@@ -1586,57 +1807,103 @@ class App(QMainWindow):
         self._log(f"Next server update check in {self.config.server_update_interval} minute(s).")
 
     def _run_server_update_then_restart(self) -> None:
-        self._log("Stopping server for SteamCMD update…")
+        self._log(f"Preparing SteamCMD update for branch '{self.config.steam_branch}'...")
 
         def _do():
             import time as _time
+
             try:
-                self.server.stop()
-                self._invoke(lambda: self._log("Stop command sent — waiting for server to exit…"))
-            except Exception as exc:
-                self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
-                return
-
-            stopped = False
-            for _ in range(15):
-                _time.sleep(2)
-                try:
-                    if not self.server.is_running():
-                        stopped = True
-                        break
-                except Exception:
-                    pass
-
-            if not stopped:
-                self._invoke(lambda: self._log(
-                    "Server did not stop within 30 s — aborting SteamCMD update."
+                running = self.server.is_running()
+                self._invoke(lambda r=running: setattr(self, "_server_running", r))
+                self._invoke(lambda r=running: self._log(
+                    "Server is currently running." if r else "Server is currently stopped."
                 ))
+            except Exception as exc:
+                self._invoke(lambda e=exc: self._log(f"Failed to determine server state before update: {e}"))
+                self._invoke(lambda: self._server_update_label.setText("Update failed"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
                 self._invoke(self._schedule_next_server_update_check)
                 return
 
-            self._invoke(lambda: self._log("Server stopped. Running SteamCMD update…"))
+            if running:
+                try:
+                    self.server.stop()
+                    self._invoke(lambda: self._log("Stop command sent — waiting for server to exit…"))
+                except Exception as exc:
+                    self._invoke(lambda e=exc: self._log(f"Stop failed: {e}"))
+                    self._invoke(lambda: self._server_update_label.setText("Update failed"))
+                    self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+                    self._invoke(self._schedule_next_server_update_check)
+                    return
+
+                stopped = False
+                for _ in range(15):
+                    _time.sleep(2)
+                    try:
+                        if not self.server.is_running():
+                            stopped = True
+                            break
+                    except Exception as exc:
+                        self._invoke(lambda e=exc: self._log(f"Server status check during shutdown failed: {e}"))
+
+                if not stopped:
+                    self._invoke(lambda: self._log(
+                        "Server did not stop within 30 seconds — aborting SteamCMD update."
+                    ))
+                    self._invoke(lambda: self._server_update_label.setText("Update failed"))
+                    self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+                    self._invoke(self._schedule_next_server_update_check)
+                    return
+            else:
+                self._invoke(lambda: self._log("Server already stopped — no shutdown needed before update."))
+
+            self._invoke(lambda: self._log(
+                f"Running SteamCMD update for branch '{self.config.steam_branch}'..."
+            ))
             self._invoke(lambda: self._server_update_label.setText("Updating…"))
             self._invoke(lambda: self._server_update_label.setStyleSheet("color: #f0a030;"))
 
-            success = self._server_update_checker.run_update()
+            success = self._server_update_checker.run_update(
+                progress_cb=lambda line: self._invoke(lambda l=line: self._log(l))
+                )   
 
             if success:
-                self._invoke(lambda: self._log("SteamCMD update completed. Starting server…"))
-                self._invoke(lambda: self._server_update_label.setText("Updated  ✓"))
+                self._invoke(lambda: self._log(
+                    f"SteamCMD update completed successfully for branch '{self.config.steam_branch}'."
+                ))
+                self._invoke(lambda: self._server_update_label.setText("Updated"))
                 self._invoke(lambda: self._server_update_label.setStyleSheet("color: #3ddc84;"))
             else:
-                self._invoke(lambda: self._log(
-                    "Server update failed — restarting on current version."
-                ))
-                self._invoke(lambda: self._server_update_label.setText("Update failed — restarted"))
+                err = (self._server_update_checker.last_error or "").strip()
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                if err:
+                    self._invoke(lambda e=err: self._log(
+                        f"SteamCMD update failed for branch '{self.config.steam_branch}': {e}"
+                    ))
+                else:
+                    self._invoke(lambda: self._log(
+                        f"SteamCMD update failed for branch '{self.config.steam_branch}'."
+                    ))
+
+                self._invoke(lambda: self._server_update_label.setText("Update failed"))
                 self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+                self._invoke(lambda: self._server_update_last_label.setText(f"Last checked: {now}"))
+                self._invoke(self._schedule_next_server_update_check)
+                return
 
             try:
                 self.server.start()
-                self._invoke(lambda: self._log("Server start command sent."))
+                self._invoke(lambda: self._log("Server start command sent after update."))
+                self._invoke(lambda: self._server_update_label.setText("Updated — restarting"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #3ddc84;"))
                 self._invoke(lambda: QTimer.singleShot(5000, self._check_server_status_threaded))
             except Exception as exc:
-                self._invoke(lambda e=exc: self._log(f"Server start failed: {e}"))
+                self._invoke(lambda e=exc: self._log(f"Server start failed after update: {e}"))
+                self._invoke(lambda: self._server_update_label.setText("Start failed"))
+                self._invoke(lambda: self._server_update_label.setStyleSheet("color: #e05252;"))
+
+            self._invoke(self._schedule_next_server_update_check)
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1669,6 +1936,16 @@ class App(QMainWindow):
         if not self.config.zomboid_dir:
             self._update_log_tab_state()
             return
+
+        if self._server_running is None:
+            self._log("Server status not yet known — delaying log tail start.")
+            return
+
+        if not self._server_running:
+            self._log("Server is not running — not starting log tail.")
+            self._log_file_label.setText("Server is not running.")
+            return
+
         self._stop_log_tail()
         self._log_tailer = LogTailer(self.config.zomboid_dir, self._on_log_line_from_thread)
         self._log_tailer.start()
@@ -1729,11 +2006,7 @@ class App(QMainWindow):
     # ------------------------------------------------------------------
 
     def _invoke(self, fn) -> None:
-        """
-        Schedule fn() to run on the main thread via a zero-delay QTimer.
-        Safe to call from any thread.
-        """
-        QTimer.singleShot(0, fn)
+        self._invoke_signal.emit(fn)
 
 
 # ---------------------------------------------------------------------------

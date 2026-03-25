@@ -1,3 +1,4 @@
 PyQt6>=6.6.0
 keyring>=24.0.0
 pytest>=8.0.0
+PyYAML>=6.0
