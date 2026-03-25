@@ -18,7 +18,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install keyring pytest
+        run: pip install keyring pytest PyYAML
 
       - name: Run tests
         run: python -m pytest test_backend.py -v
