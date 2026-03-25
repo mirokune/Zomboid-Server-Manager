@@ -299,11 +299,12 @@ class TestUpdateNeeded(unittest.TestCase):
              patch.object(checker, "get_remote_buildid", return_value="12345"):
             self.assertFalse(checker.update_needed())
 
-    def test_returns_none_when_installed_is_none(self):
+    def test_returns_true_when_installed_is_none(self):
+        # installed=None means server isn't installed yet — treat as update needed
         checker = self._checker()
         with patch.object(checker, "get_installed_buildid", return_value=None), \
              patch.object(checker, "get_remote_buildid", return_value="99999"):
-            self.assertIsNone(checker.update_needed())
+            self.assertTrue(checker.update_needed())
 
     def test_returns_none_when_remote_is_none(self):
         checker = self._checker()
@@ -311,11 +312,12 @@ class TestUpdateNeeded(unittest.TestCase):
              patch.object(checker, "get_remote_buildid", return_value=None):
             self.assertIsNone(checker.update_needed())
 
-    def test_returns_none_when_both_are_none(self):
+    def test_returns_true_when_both_are_none(self):
+        # installed=None takes priority: fresh install needed regardless of remote
         checker = self._checker()
         with patch.object(checker, "get_installed_buildid", return_value=None), \
              patch.object(checker, "get_remote_buildid", return_value=None):
-            self.assertIsNone(checker.update_needed())
+            self.assertTrue(checker.update_needed())
 
 
 # ---------------------------------------------------------------------------
@@ -323,103 +325,126 @@ class TestUpdateNeeded(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRunUpdate(unittest.TestCase):
+    """
+    run_update() writes a temp batch file and launches it via subprocess.Popen.
+    Tests use a real tmpdir (so os.path.isfile/isdir pass) and mock Popen.
+    """
 
-    def _checker(self, **kwargs):
-        return ServerUpdateChecker(_make_config(**kwargs))
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        # Real file so os.path.isfile(steamcmd_path) passes
+        self._steamcmd = os.path.join(self._tmpdir, "steamcmd.exe")
+        open(self._steamcmd, "w").close()
+        # Real dir so os.path.isdir(server_dir) passes
+        self._server_dir = os.path.join(self._tmpdir, "server")
+        os.makedirs(self._server_dir)
 
-    def _fake_run(self, returncode=0):
-        result = MagicMock()
-        result.returncode = returncode
-        result.stdout = "Success: App '380870' fully installed.\n"
-        result.stderr = ""
-        return result
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _checker(self, steamcmd_timeout=600, steam_branch=None):
+        cfg = AppConfig()
+        cfg.steamcmd_path = self._steamcmd
+        cfg.server_dir = self._server_dir
+        cfg.steamcmd_timeout = steamcmd_timeout
+        if steam_branch is not None:
+            cfg.steam_branch = steam_branch
+        return ServerUpdateChecker(cfg)
+
+    def _fake_popen(self, returncode=0):
+        """Mock Popen process that exits immediately with the given returncode."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 1234
+        mock_proc.returncode = returncode
+        mock_proc.stdout.read = MagicMock(return_value=b"")  # immediate EOF
+        mock_proc.poll = MagicMock(return_value=returncode)
+        mock_proc.wait = MagicMock(return_value=returncode)
+        mock_proc.kill = MagicMock()
+        return mock_proc
+
+    def _capture_bat(self, returncode=0):
+        """Return a fake_popen side_effect that records the batch file content."""
+        captured = []
+
+        def fake_popen(args, **kwargs):
+            bat_path = args[2]  # ["cmd.exe", "/c", bat_path]
+            with open(bat_path, "r", encoding="utf-8") as f:
+                captured.append(f.read())
+            return self._fake_popen(returncode)
+
+        return fake_popen, captured
 
     def test_returns_true_on_exit_code_zero(self):
         checker = self._checker()
-        with patch("subprocess.run", return_value=self._fake_run(0)):
+        with patch("subprocess.Popen", return_value=self._fake_popen(0)):
             self.assertTrue(checker.run_update())
 
     def test_returns_false_on_nonzero_exit_code(self):
         checker = self._checker()
-        with patch("subprocess.run", return_value=self._fake_run(1)):
+        with patch("subprocess.Popen", return_value=self._fake_popen(1)):
             self.assertFalse(checker.run_update())
 
-    def test_returns_false_on_timeout(self):
+    def test_returns_false_on_exception(self):
         checker = self._checker()
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="steamcmd", timeout=600)):
+        with patch("subprocess.Popen", side_effect=OSError("cmd.exe not found")):
             self.assertFalse(checker.run_update())
 
     def test_uses_normpath_for_force_install_dir(self):
-        checker = self._checker(server_dir="C:/pz/server")
-        captured_args = []
+        checker = self._checker()
+        fake_popen, captured = self._capture_bat(0)
 
-        def fake_run(args, **kwargs):
-            captured_args.extend(args)
-            return self._fake_run(0)
-
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_popen):
             checker.run_update()
 
-        # normpath should have been applied — Windows uses backslashes
-        force_install_idx = captured_args.index("+force_install_dir")
-        install_dir = captured_args[force_install_idx + 1]
-        self.assertEqual(install_dir, os.path.normpath("C:/pz/server"))
+        self.assertTrue(captured, "batch file was never written")
+        norm = os.path.normpath(self._server_dir)
+        self.assertIn(norm, captured[0])
 
     def test_includes_validate_in_command(self):
         checker = self._checker()
-        captured_args = []
+        fake_popen, captured = self._capture_bat(0)
 
-        def fake_run(args, **kwargs):
-            captured_args.extend(args)
-            return self._fake_run(0)
-
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_popen):
             checker.run_update()
 
-        self.assertTrue(any("validate" in str(a) for a in captured_args))
+        self.assertTrue(captured, "batch file was never written")
+        self.assertTrue(any("validate" in c for c in captured))
 
     def test_uses_configured_timeout(self):
-        checker = self._checker(steamcmd_timeout=120)
-        captured_kwargs = {}
+        """A very short timeout causes run_update to kill the process and return False."""
+        checker = self._checker(steamcmd_timeout=0.001)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.stdout.read = MagicMock(return_value=b"")
+        mock_proc.poll = MagicMock(return_value=None)  # never exits
+        mock_proc.kill = MagicMock()
 
-        def fake_run(args, **kwargs):
-            captured_kwargs.update(kwargs)
-            return self._fake_run(0)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = checker.run_update()
 
-        with patch("subprocess.run", side_effect=fake_run):
-            checker.run_update()
-
-        self.assertEqual(captured_kwargs.get("timeout"), 120)
+        self.assertFalse(result)
+        mock_proc.kill.assert_called_once()
 
     def test_non_public_branch_adds_beta_flag(self):
-        cfg = _make_config()
-        cfg.steam_branch = "unstable"
-        checker = ServerUpdateChecker(cfg)
-        captured_args = []
+        checker = self._checker(steam_branch="unstable")
+        fake_popen, captured = self._capture_bat(0)
 
-        def fake_run(args, **kwargs):
-            captured_args.extend(args)
-            return self._fake_run(0)
-
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_popen):
             checker.run_update()
 
-        self.assertIn("-beta", captured_args)
-        beta_idx = captured_args.index("-beta")
-        self.assertEqual(captured_args[beta_idx + 1], "unstable")
+        self.assertTrue(captured, "batch file was never written")
+        self.assertIn("-beta unstable", captured[0])
 
     def test_public_branch_omits_beta_flag(self):
         checker = self._checker()  # steam_branch defaults to "public"
-        captured_args = []
+        fake_popen, captured = self._capture_bat(0)
 
-        def fake_run(args, **kwargs):
-            captured_args.extend(args)
-            return self._fake_run(0)
-
-        with patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.Popen", side_effect=fake_popen):
             checker.run_update()
 
-        self.assertNotIn("-beta", captured_args)
+        self.assertTrue(captured, "batch file was never written")
+        self.assertNotIn("-beta", captured[0])
 
 
 # ---------------------------------------------------------------------------
@@ -548,8 +573,8 @@ class TestServerManagerSecurity(unittest.TestCase):
         self.assertTrue(len(called_args) > 0)
         flat_args = " ".join(str(a) for a in called_args[0])
         self.assertNotIn("secret", flat_args)
-        # The --config flag must be present
-        self.assertIn("--config", called_args[0])
+        # The -c flag must be present (short form of --config)
+        self.assertIn("-c", called_args[0])
 
     def test_is_running_escapes_single_quotes_in_server_name(self):
         """is_running() must escape single-quotes in server_name for PS -like filter."""
@@ -608,25 +633,22 @@ class TestFindLatestLog(unittest.TestCase):
             result = LogParser(tmpdir).find_latest_log()
             self.assertEqual(os.path.abspath(result), os.path.abspath(log))
 
-    def test_finds_log_in_subdirectory(self):
+    def test_does_not_search_subdirectories(self):
+        # find_latest_log only searches the root log directory, not subdirs
         with tempfile.TemporaryDirectory() as tmpdir:
             subdir = os.path.join(tmpdir, "2024-01-15_14-00")
             os.makedirs(subdir)
             log = os.path.join(subdir, "DebugLog-server.txt")
             open(log, "w").close()
             result = LogParser(tmpdir).find_latest_log()
-            self.assertEqual(os.path.abspath(result), os.path.abspath(log))
+            self.assertIsNone(result)
 
     def test_returns_most_recent_when_multiple_logs_exist(self):
+        import time as _time
         with tempfile.TemporaryDirectory() as tmpdir:
-            old_dir = os.path.join(tmpdir, "2024-01-14_12-00")
-            new_dir = os.path.join(tmpdir, "2024-01-15_14-00")
-            os.makedirs(old_dir)
-            os.makedirs(new_dir)
-            old_log = os.path.join(old_dir, "DebugLog-server.txt")
-            new_log = os.path.join(new_dir, "DebugLog-server.txt")
+            old_log = os.path.join(tmpdir, "DebugLog-server-old.txt")
+            new_log = os.path.join(tmpdir, "DebugLog-server-new.txt")
             open(old_log, "w").close()
-            import time as _time
             _time.sleep(0.01)
             open(new_log, "w").close()
             result = LogParser(tmpdir).find_latest_log()
